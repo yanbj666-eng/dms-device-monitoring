@@ -2,6 +2,8 @@
 # 约束(HLD §1):不依赖 socket/SQL/UI;仅依赖 Qt Core 值类型
 add_library(dms_protocol STATIC
     Crc32.cpp
+    Frame.cpp
+    FrameDecoder.cpp
 )
 
 target_include_directories(dms_protocol PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
