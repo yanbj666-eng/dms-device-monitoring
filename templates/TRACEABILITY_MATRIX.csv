@@ -1,0 +1,30 @@
+Requirement ID,Requirement,Design Module,Implementation,Test Case,Status
+REQ-CONN-001,TCP设备连接,TcpTransport,,TC-CONN-002,Planned
+REQ-CONN-002,断线自动重连,DeviceSession,,TC-CONN-001;TC-CONN-004;TC-CONN-005,Planned
+REQ-CONN-003,心跳和失联判定,DeviceSession,,TC-CONN-003;TC-ALARM-003,Planned
+REQ-PROTO-001,协议解析与CRC,FrameDecoder/MessageCodec,,TC-PROTO-001;TC-PROTO-004;TC-PROTO-006;TC-PROTO-007;TC-PROTO-010,Planned
+REQ-PROTO-002,流拆包和有界缓存,FrameDecoder,,TC-PROTO-002;TC-PROTO-003;TC-PROTO-005;TC-PROTO-011,Planned
+REQ-PROTO-003,TLV及类型校验,MessageCodec,,TC-PROTO-008;TC-PROTO-009;TC-PROTO-010,Planned
+REQ-THREAD-001,线程归属及退出,Thread Model/Workers,,TC-THREAD-001;TC-THREAD-002,Planned
+REQ-DEVICE-001,设备配置增删改,DeviceManager/ConfigValidator,,TC-CONFIG-003;TC-UI-001,Planned
+REQ-UI-001,设备状态展示,DeviceListModel,,TC-UI-001;TC-CONN-003,Planned
+REQ-UI-002,四指标和曲线,TelemetryView,,TC-UI-001;TC-PERF-001,Planned
+REQ-ALARM-001,阈值和告警生命周期,AlarmEngine,,TC-ALARM-001;TC-ALARM-002,Planned
+REQ-ALARM-002,通信协议与陈旧告警,AlarmEngine/DeviceSession,,TC-ALARM-003;TC-ALARM-004,Planned
+REQ-DB-001,遥测持久化,TelemetryRepository/DatabaseWorker,,TC-DB-001;TC-DB-002;TC-DB-003;TC-DB-004,Planned
+REQ-DB-002,历史查询与CSV,TelemetryRepository/HistoryView,,TC-DB-001;TC-DB-007,Planned
+REQ-DB-003,数据库版本和故障,DatabaseWorker/Migration,,TC-DB-003;TC-DB-005;TC-DB-006,Planned
+REQ-LOG-001,结构化滚动日志,AppLogger,,TC-LOG-001,Planned
+REQ-CMD-001,四命令及ACK,MessageCodec/DeviceSession,,TC-CMD-001,Planned
+REQ-CMD-002,命令状态和记录,DeviceSession/CommandRepository,,TC-CMD-002;TC-CMD-003;TC-DB-006,Planned
+REQ-CONFIG-001,配置契约校验,ConfigValidator,,TC-CONFIG-001;TC-CONFIG-002;TC-CONFIG-003,Planned
+REQ-SIM-001,多设备可复现模拟,DeviceSimulator,,TC-SIM-001,Planned
+REQ-SIM-002,故障注入,DeviceSimulator,,TC-SIM-002,Planned
+REQ-UDP-001,UDP报文及来源隔离,UdpTransport/DeviceSession,,TC-UDP-001;TC-UDP-002,Planned
+REQ-SERIAL-001,串口通信及错误恢复,SerialTransport,,TC-SERIAL-001;TC-SERIAL-002,Planned
+REQ-TEST-001,核心自动化测试,Qt Test/CTest,,TC-ARCH-001;TC-DEPLOY-001,Planned
+REQ-DEPLOY-001,跨平台构建部署,CMake/Packaging,,TC-DEPLOY-001;TC-DEPLOY-002,Planned
+REQ-PERF-001,刷新延迟和吞吐,Snapshot/Queues/UI,,TC-PERF-001,Planned
+REQ-STABILITY-001,8小时稳定性,System,,TC-STABILITY-001,Planned
+REQ-ARCH-001,分层及可测试性,HLD/Module Targets,,TC-ARCH-001,Planned
+REQ-RECOVERY-001,异常隔离与有界恢复,Workers/Queues,,TC-RECOVERY-001;TC-DB-004,Planned

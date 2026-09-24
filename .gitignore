@@ -1,0 +1,33 @@
+# ---- 构建产物 ----
+build/
+build-*/
+out/
+cmake-build-*/
+
+# ---- IDE / 本机工具配置 ----
+.vscode/
+.idea/
+.claude/
+CMakeUserPresets.json
+compile_commands.json
+*.user
+
+# ---- Qt 生成文件 ----
+moc_*.cpp
+moc_*.h
+qrc_*.cpp
+.qtc_clangd/
+
+# ---- 备份与压缩包 ----
+backups/
+*.zip
+
+# ---- 运行时数据 ----
+*.log
+logs/
+data/*.sqlite
+data/*.db
+
+# ---- 操作系统 ----
+Thumbs.db
+.DS_Store
