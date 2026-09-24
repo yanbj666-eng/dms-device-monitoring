@@ -1,0 +1,25 @@
+# 统一换行符策略:仓库内文本一律 LF,Windows 检出时按类型转换
+# 解决 Windows(git add 时的 LF->CRLF 警告)与 Ubuntu(WSL)之间的换行符一致性问题
+* text=auto
+
+# 脚本类:按平台各自的原生换行
+*.sh   text eol=lf
+*.bash text eol=lf
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+# Windows 工程文件
+*.sln     text eol=crlf
+*.vcxproj text eol=crlf
+
+# 二进制文件:禁止任何转换
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.ico   binary
+*.zip   binary
+*.pdf   binary
+*.onnx  binary
+*.sqlite binary
+*.db    binary
