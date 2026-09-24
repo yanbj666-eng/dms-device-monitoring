@@ -2,9 +2,9 @@
 
 ## 当前状态与阅读顺序
 
-截至本轮文档核查，当前目录是**需求/设计/测试规划包**，尚无 C++ 源码、CMake 工程、测试程序或可执行发布包，也未初始化 Git。下文“支持”均指目标功能，不能作为已经完成的成果。
+截至本轮文档核查，当前目录已进入实施阶段。**S1 协议层完成（2026-09-24）**：CMake target-based 工程、CRC-32/ISO-HDLC、18B 大端帧编解码、有界流式 FrameDecoder（半包/粘包/坏 CRC 重同步）、TLV MessageCodec（遥测/命令/ACK），3 个测试套件 41 项用例全部通过（`scripts\build.bat` 一键构建）。S2 起按 PRD 阶段推进；下文“支持”仍指目标功能，未实现部分不能作为已完成成果。
 
-文档基线 D1（2026-09-23 起）；本轮仅完善文档与追踪模板。先读 [评审记录](docs/14_DOCUMENT_REVIEW.md)，再按 [PRD](docs/01_PRD.md) → [SRS](docs/02_SRS.md) → [架构](docs/03_HLD_ARCHITECTURE.md) → [详细设计](docs/04_DETAILED_DESIGN.md) 阅读。实施前对照 [协议](docs/05_PROTOCOL_SPEC.md)、[数据库](docs/06_DATABASE_DESIGN.md)、[配置](docs/15_CONFIGURATION.md) 和 [测试计划](docs/07_TEST_PLAN.md)。
+文档基线 D1（2026-09-23 起）。先读 [评审记录](docs/14_DOCUMENT_REVIEW.md)，再按 [PRD](docs/01_PRD.md) → [SRS](docs/02_SRS.md) → [架构](docs/03_HLD_ARCHITECTURE.md) → [详细设计](docs/04_DETAILED_DESIGN.md) 阅读。实施前对照 [协议](docs/05_PROTOCOL_SPEC.md)、[数据库](docs/06_DATABASE_DESIGN.md)、[配置](docs/15_CONFIGURATION.md) 和 [测试计划](docs/07_TEST_PLAN.md)。
 
 保留全部必需功能，按 S1–S8 分阶段推进；TCP 阶段演示不能代替 UDP/串口及最终跨平台验收。历史回放、广播发现、实物板卡、AI 为可选。
 
