@@ -1,42 +1,21 @@
 // tst_framedecoder:流式帧解码器测试
 // 主向量:协议规范 §5 的独立固定帧(含 CRC),不做编码器↔解码器互验
-// 边界向量:用测试内辅助函数构造(半包/粘包/坏CRC/未知类型/溢出/单轮上限)
+// 边界向量:用库内 encodeFrame 构造(半包/粘包/坏CRC/未知类型/溢出/单轮上限)
 #include <QtTest>
 
-#include <QtEndian>
-
-#include <cstring>
-
-#include "Crc32.h"
 #include "Frame.h"
 #include "FrameDecoder.h"
 
-using dms::protocol::Crc32;
 using dms::protocol::DecodedFrame;
 using dms::protocol::FrameDecoder;
-using dms::protocol::FrameHeader;
 using dms::protocol::MessageType;
 
 namespace {
 
-// 测试辅助:构造完整帧(模拟器正式编码在 S2,这里仅供边界用例)
+// 委托给库内统一编码入口,与模拟器(S2)/命令发送(S3)同一套实现
 QByteArray buildFrame(quint8 type, quint32 seq, quint64 ts, const QByteArray &payload)
 {
-    FrameHeader h;
-    h.type = type;
-    h.seq = seq;
-    h.payloadLen = quint16(payload.size());
-    h.timestampMs = ts;
-
-    QByteArray f(dms::protocol::frameTotalSize(payload.size()), Qt::Uninitialized);
-    auto *p = reinterpret_cast<uchar *>(f.data());
-    FrameHeader::encode(h, p);
-    if (!payload.isEmpty()) // 空载荷 constData() 可能为 null,memcpy 0 字节是 UB
-        memcpy(p + dms::protocol::kFixedHeaderSize, payload.constData(), payload.size());
-    const quint32 crc = Crc32::compute(reinterpret_cast<const uchar *>(f.constData()),
-                                        f.size() - dms::protocol::kCrcSize);
-    qToBigEndian<quint32>(crc, p + f.size() - dms::protocol::kCrcSize);
-    return f;
+    return dms::protocol::encodeFrame(type, seq, ts, payload);
 }
 
 } // namespace

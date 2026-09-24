@@ -9,4 +9,9 @@ target_compile_features(tst_framedecoder PRIVATE cxx_std_17)
 target_link_libraries(tst_framedecoder PRIVATE dms_protocol Qt6::Test)
 add_test(NAME tst_framedecoder COMMAND tst_framedecoder)
 
+add_executable(tst_messagecodec tst_messagecodec.cpp)
+target_compile_features(tst_messagecodec PRIVATE cxx_std_17)
+target_link_libraries(tst_messagecodec PRIVATE dms_protocol Qt6::Test)
+add_test(NAME tst_messagecodec COMMAND tst_messagecodec)
+
 # /utf-8 与警告选项已随 dms_protocol PUBLIC 传播

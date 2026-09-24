@@ -47,6 +47,11 @@ inline constexpr int frameTotalSize(int payloadLen)
     return kFixedHeaderSize + payloadLen + kCrcSize;
 }
 
+// 组装完整帧:18B 头 + 载荷 + CRC。
+// 发送侧唯一入口:模拟器(S2)/客户端命令(S3)/测试共用,保证编码口径一致
+QByteArray encodeFrame(quint8 type, quint32 seq, quint64 timestampMs,
+                       const QByteArray &payload);
+
 // 18B 固定头。所有多字节字段大端(协议 §1);
 // 禁止未对齐字节强转 struct(LLD §2),必须逐字段 qFromBigEndian
 struct FrameHeader

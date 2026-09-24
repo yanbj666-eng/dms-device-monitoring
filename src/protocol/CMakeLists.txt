@@ -4,6 +4,7 @@ add_library(dms_protocol STATIC
     Crc32.cpp
     Frame.cpp
     FrameDecoder.cpp
+    MessageCodec.cpp
 )
 
 target_include_directories(dms_protocol PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
