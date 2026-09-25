@@ -55,6 +55,7 @@ struct SessionConfig {
     int firstFrameTimeoutMs = 4000;     // 打开后无首个有效帧 → 重连
     int metricTimeoutMs = 3000;         // 必需指标无更新 → Degraded
     int frameAssemblyTimeoutMs = 2000;  // 组帧半包滞留上限
+    int decoderMaxBufferBytes = 65536;  // 解码缓存上限 app.ini max_buffer_bytes
     int commandAckTimeoutMs = 2000;     // 命令 ACK 超时
     int consecutiveBadCrcLimit = 5;     // 连续 CRC 错 → Degraded
     int goodFramesToRecoverOnline = 3;  // Degraded → Online 需连续有效帧

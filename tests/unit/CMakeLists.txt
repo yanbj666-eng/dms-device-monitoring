@@ -30,4 +30,10 @@ target_compile_features(tst_devicesession PRIVATE cxx_std_17)
 target_link_libraries(tst_devicesession PRIVATE dms_domain Qt6::Test)
 add_test(NAME tst_devicesession COMMAND tst_devicesession)
 
+# 配置装配层:devices.json + app.ini 全量校验(docs/15)
+add_executable(tst_config tst_config.cpp)
+target_compile_features(tst_config PRIVATE cxx_std_17)
+target_link_libraries(tst_config PRIVATE dms_app Qt6::Test)
+add_test(NAME tst_config COMMAND tst_config)
+
 # /utf-8 与警告选项已随 dms_protocol PUBLIC 传播

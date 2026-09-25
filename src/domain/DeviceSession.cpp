@@ -24,6 +24,7 @@ DeviceSession::DeviceSession(QString deviceId, dms::transport::ITransport *trans
       deviceId_(std::move(deviceId)),
       sessionId_(QUuid::createUuid()), // 本地会话标识,重启即新会话(LLD §4)
       transport_(transport),
+      decoder_(config.decoderMaxBufferBytes), // app.ini max_buffer_bytes(S4 接线)
       config_(config),
       clock_(std::move(clock)),
       jitter_(std::move(jitter))

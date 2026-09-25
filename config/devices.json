@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "devices": [
+    {
+      "id": "sim-tcp-01",
+      "name": "TCP 模拟设备 01",
+      "enabled": true,
+      "transport": "tcp",
+      "host": "127.0.0.1",
+      "port": 9001,
+      "alarm_rules": [
+        {"metric_id": 1, "low": 0.0, "high": 80.0, "hysteresis": 2.0}
+      ]
+    },
+    {
+      "id": "sim-udp-01",
+      "name": "UDP 模拟设备 01",
+      "enabled": false,
+      "transport": "udp",
+      "bind_address": "127.0.0.1",
+      "bind_port": 9100,
+      "peer_address": "127.0.0.1",
+      "peer_port": 9101,
+      "alarm_rules": []
+    },
+    {
+      "id": "sim-serial-01",
+      "name": "串口模拟设备 01",
+      "enabled": false,
+      "transport": "serial",
+      "port_name": "COM3",
+      "baud_rate": 115200,
+      "data_bits": 8,
+      "parity": "none",
+      "stop_bits": 1,
+      "flow_control": "none",
+      "alarm_rules": []
+    }
+  ]
+}
