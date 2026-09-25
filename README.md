@@ -2,7 +2,7 @@
 
 ## 当前状态与阅读顺序
 
-截至本轮文档核查，当前目录已进入实施阶段。**S1 协议层完成（2026-09-24）**：CMake target-based 工程、CRC-32/ISO-HDLC、18B 大端帧编解码、有界流式 FrameDecoder（半包/粘包/坏 CRC 重同步）、TLV MessageCodec（遥测/命令/ACK），3 个测试套件 41 项用例全部通过（`scripts\build.bat` 一键构建）。S2 起按 PRD 阶段推进；下文“支持”仍指目标功能，未实现部分不能作为已完成成果。
+截至本轮文档核查，当前目录已进入实施阶段。**S1 协议层完成（2026-09-24）**：CMake target-based 工程、CRC-32/ISO-HDLC、18B 大端帧编解码、有界流式 FrameDecoder（半包/粘包/坏 CRC 重同步）、TLV MessageCodec（遥测/命令/ACK）。**S2 TCP 通信层完成（2026-09-24）**：结构化日志（滚动+同键聚合+RAW 帧）、`TcpTransport`（64KiB 背压、generation 防陈旧回调、结构化错误、无自动重连）、`DeviceSession` 雏形（解码分发+计数+值对象信号）、多设备 TCP 模拟器 `dms_simulator`（固定种子、8 种故障注入、SIM READY 同步行）。7 个测试套件全部通过（6 单元 + 1 集成，集成用 QProcess 拉起真实模拟器进程验证单/多设备收发、命令 ACK 生命周期与全部故障注入；`scripts\build.bat` 一键构建）。S3 起按 PRD 阶段推进；下文“支持”仍指目标功能，未实现部分不能作为已完成成果。
 
 文档基线 D1（2026-09-23 起）。先读 [评审记录](docs/14_DOCUMENT_REVIEW.md)，再按 [PRD](docs/01_PRD.md) → [SRS](docs/02_SRS.md) → [架构](docs/03_HLD_ARCHITECTURE.md) → [详细设计](docs/04_DETAILED_DESIGN.md) 阅读。实施前对照 [协议](docs/05_PROTOCOL_SPEC.md)、[数据库](docs/06_DATABASE_DESIGN.md)、[配置](docs/15_CONFIGURATION.md) 和 [测试计划](docs/07_TEST_PLAN.md)。
 
