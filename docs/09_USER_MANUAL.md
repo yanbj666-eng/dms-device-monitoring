@@ -1,6 +1,29 @@
 # 09. 用户手册草案
 
 > D1 · 2026-09-23 · 尚无可运行程序或安装包。本手册是预期操作与验收步骤；按钮名、程序名和部署命令须在 S8 用实际版本确认。
+> 2026-09-26 更新：S4 起已有可运行上位机（`dms_monitor`），§0 记录当前实际操作；其余章节仍是目标设计，未实现部分以 §0 为准。
+
+## 0. S4 实际操作（已验证部分）
+
+构建与测试：`scripts\build.bat`（9 套件 150 用例）。
+
+> 2026-09-26 冒烟记录：10 台设备实测通过「启动全 Online → 强杀模拟器（≤5s 全部 Reconnecting、失败按真实原因 CONNECT_TIMEOUT 归因退避）→ 重启模拟器自动恢复 Online → 优雅关闭无残留」全链路。期间发现并修复 S3 缺陷：重连点火未清上一轮连接的打开时刻，异步建链期间首个轮询周期即误报「无首帧超时」（回归用例 `reconnectAttemptNotKilledByStaleOpenTimestamp`）。
+
+```bat
+:: 终端 1:10 设备模拟器(端口 9001-9010,遥测 100ms,心跳 1s)
+build\simulator\dms_simulator.exe -c 10 -p 9001
+
+:: 终端 2:上位机(默认运行根 = AppLocalDataLocation,首启从 exe 旁 config\ 复制模板)
+build\src\app\dms_monitor.exe
+:: 验收/演示:指定独立运行根,devices.json 配 10 台 tcp 设备(9001-9010)
+build\src\app\dms_monitor.exe --config-dir <dir>
+```
+
+界面（S4 最小 UI，单窗口）：左侧设备列表（名称 + 状态文字/色点 + 最近遥测时间），右侧选中设备的四指标曲线（temperature °C / pressure kPa / voltage V / rpm r/min，600 点/指标，100ms 合并刷新）；工具栏「全部连接 / 全部断开 / Reset / 采样周期(ms)+应用周期」；状态栏显示在线计数与命令结果。Reset=命令 3（无参），采样周期=命令 4 SetParameter（参数 id=1 uint32 大端，100–1000ms）。
+
+尚未实现（按计划）：Diagnostics 页、告警、历史/CSV、UDP/串口、在线配置编辑（改配置需重启）。
+
+验收要点：启动后 ~1s 内 10 台全部 Online；关闭模拟器 ≤5s 全部转 Reconnecting、退避重连；重启模拟器自动恢复 Online；断开状态下发命令状态栏提示被拒。
 
 ## 1. 使用前提
 

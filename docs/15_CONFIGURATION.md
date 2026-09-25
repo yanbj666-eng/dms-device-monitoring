@@ -1,10 +1,10 @@
 # 15. 配置与运行目录契约
 
-> D1 · 2026-09-23 · 设计态；以下示例是文档内的配置样例，当前没有可读取它们的程序。对应 REQ-CONFIG-001、REQ-DEVICE-001。
+> D1 · 2026-09-23 · 设计态；2026-09-26 S4 起本契约由 `dms_monitor` 实际执行（§2/§3 JSON 校验、§4 INI 校验与默认值已实现并有 tst_config 34 用例覆盖）。对应 REQ-CONFIG-001、REQ-DEVICE-001。
 
 ## 1. 路径与来源
 
-规划通过 QStandardPaths::AppLocalDataLocation 取得可写运行根目录，启动日志显示解析后的绝对路径。根目录下为 config/devices.json、config/app.ini、data/dms.db、logs/、exports/。发布包内 config 只作首次初始化模板；已有用户配置不覆盖。数据库路径相对该根目录解析，不能相对当前工作目录或强制写入安装目录。
+运行根目录经 QStandardPaths::AppLocalDataLocation 取得，启动日志显示解析后的绝对路径；开发/验收可用 `--config-dir <dir>` 指定独立运行根（其下仍为 config/… 结构），不污染用户配置。根目录下为 config/devices.json、config/app.ini、data/dms.db、logs/、exports/。发布包内 config 只作首次初始化模板（S4：随可执行文件部署，首启复制，已存在不覆盖）；已有用户配置不覆盖。数据库路径相对该根目录解析，不能相对当前工作目录或强制写入安装目录。
 
 连接配置只以 devices.json 为源，数据库 devices 是历史关联镜像。保存流程：全量校验→同目录临时文件→原子替换→停用受影响会话→同步元数据→应用新快照。写文件失败保留旧文件；元数据失败时相关设备保持禁用并显示 CONFIG_APPLY_FAILED，重试成功后才允许连接，不假称配置已完全生效。设备删除只禁用 DB 元数据，历史数据保留。
 

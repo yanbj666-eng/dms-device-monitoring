@@ -2,7 +2,7 @@
 
 ## 当前状态与阅读顺序
 
-截至本轮文档核查，当前目录已进入实施阶段。**S1 协议层完成（2026-09-24）**：CMake target-based 工程、CRC-32/ISO-HDLC、18B 大端帧编解码、有界流式 FrameDecoder（半包/粘包/坏 CRC 重同步）、TLV MessageCodec（遥测/命令/ACK）。**S2 TCP 通信层完成（2026-09-24）**：结构化日志（滚动+同键聚合+RAW 帧）、`TcpTransport`（64KiB 背压、generation 防陈旧回调、结构化错误、无自动重连）、`DeviceSession` 雏形（解码分发+计数+值对象信号）、多设备 TCP 模拟器 `dms_simulator`（固定种子、8 种故障注入、SIM READY 同步行）。**S3 会话状态机完成（2026-09-26）**：`DeviceSession` 六状态状态机（Connecting/Online/Degraded/Reconnecting/Disconnected/Fault，可注入时钟+抖动源）、自动重连指数退避（1/2/4/8/10s ±10% 抖动，稳定 Online 10s 清零）、存活判定（心跳+遥测任一刷新、四指标独立新鲜度、连续 5 CRC 错降级）、组帧 2000ms 超时、命令生命周期（`CommandTracker`：Sent→Succeeded/Rejected/TimedOut/Cancelled/Failed，每设备一未决槽、迟到/重复 ACK 只记日志、Seq 跨重连不复位）。7 个测试套件全部通过（6 单元 + 1 集成共 103 用例；集成用 QProcess 拉起真实模拟器验证自动重连、命令超时/取消、失联降级-恢复全链路；`scripts\build.bat` 一键构建）。S4 起按 PRD 阶段推进；下文“支持”仍指目标功能，未实现部分不能作为已完成成果。
+截至本轮文档核查，当前目录已进入实施阶段。**S1 协议层完成（2026-09-24）**：CMake target-based 工程、CRC-32/ISO-HDLC、18B 大端帧编解码、有界流式 FrameDecoder（半包/粘包/坏 CRC 重同步）、TLV MessageCodec（遥测/命令/ACK）。**S2 TCP 通信层完成（2026-09-24）**：结构化日志（滚动+同键聚合+RAW 帧）、`TcpTransport`（64KiB 背压、generation 防陈旧回调、结构化错误、无自动重连）、`DeviceSession` 雏形（解码分发+计数+值对象信号）、多设备 TCP 模拟器 `dms_simulator`（固定种子、8 种故障注入、SIM READY 同步行）。**S3 会话状态机完成（2026-09-26）**：`DeviceSession` 六状态状态机（Connecting/Online/Degraded/Reconnecting/Disconnected/Fault，可注入时钟+抖动源）、自动重连指数退避（1/2/4/8/10s ±10% 抖动，稳定 Online 10s 清零）、存活判定（心跳+遥测任一刷新、四指标独立新鲜度、连续 5 CRC 错降级）、组帧 2000ms 超时、命令生命周期（`CommandTracker`：Sent→Succeeded/Rejected/TimedOut/Cancelled/Failed，每设备一未决槽、迟到/重复 ACK 只记日志、Seq 跨重连不复位）。**S4 上位机与设备管理完成（2026-09-26）**：配置装配层（devices.json + app.ini 全量校验 → `TcpTransportConfig`/`SessionConfig` 值对象，未知字段/类型/范围/跨字段约束一次报全，首启模板初始化）、`DeviceManager`（IO 线程 worker-object：聚合会话、全量替换装配、统一启停、命令路由、信号带 deviceId 转发）、最小 UI（`dms_monitor`：设备列表 + 四指标实时曲线 + Reset/SetParameter 命令，100ms 合并刷新，QPainter 自绘曲线——本机 Qt 无 QtCharts，选定记录见 HLD §5）、IO 线程装配与退出顺序（阻塞停会话 → quit/wait）。9 个测试套件全部通过（8 单元 + 1 集成共 150 用例；集成用 QProcess 拉起真实模拟器验证自动重连、命令超时/取消、失联降级-恢复全链路；`scripts\build.bat` 一键构建）。S4 集成冒烟实测 10 台设备「全 Online → 强杀模拟器退避重连（真实归因）→ 重启自动恢复 → 优雅退出」闭环，并发现修复 S3 一处缺陷：重连点火未清上一轮打开时刻，异步建链期间误报「无首帧超时」（已补回归用例）。S5 起按 PRD 阶段推进；下文“支持”仍指目标功能，未实现部分不能作为已完成成果。
 
 文档基线 D1（2026-09-23 起）。先读 [评审记录](docs/14_DOCUMENT_REVIEW.md)，再按 [PRD](docs/01_PRD.md) → [SRS](docs/02_SRS.md) → [架构](docs/03_HLD_ARCHITECTURE.md) → [详细设计](docs/04_DETAILED_DESIGN.md) 阅读。实施前对照 [协议](docs/05_PROTOCOL_SPEC.md)、[数据库](docs/06_DATABASE_DESIGN.md)、[配置](docs/15_CONFIGURATION.md) 和 [测试计划](docs/07_TEST_PLAN.md)。
 
@@ -21,7 +21,7 @@
 - Qt 6.x Widgets
 - Qt Network
 - Qt SerialPort
-- 实时曲线后端：在 S4 按可用 Qt 组件选定并记录；保留 Qt Charts/简单绘图候选，新增第三方库前评估维护与许可
+- 实时曲线后端：S4 已选定 QPainter 自绘（`CurveWidget`，本机 Qt 6.8.3 官方安装未含 QtCharts；600 点重绘开销可忽略，无第三方依赖）
 - SQLite / Qt SQL
 - CMake
 - Qt Test + CTest

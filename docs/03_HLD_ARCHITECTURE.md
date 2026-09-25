@@ -75,6 +75,8 @@ templates/
 
 当前只交付文档和模板。未来使用 target-based CMake、C++17 和 Qt6 Core/Widgets/Network/SerialPort/Sql/Test；客户端/模拟器独立入口，测试链接被测模块。图表后端在 S4 按本地 Qt 可用性选定并记录；更换后端不免除实时曲线验收。
 
+> **S4 选定记录（2026-09-26）**：本机 Qt 6.8.3（msvc2022_64，官方在线安装）未包含 QtCharts 模块。曲线后端选定 **QPainter 自绘**（`src/ui/CurveWidget.cpp`）：折线 + 网格 + 自适应量程，每指标 ≤600 点重绘开销可忽略，避免引入第三方依赖；更换后端时保持“100ms 合并刷新、有界点数、原始采集不受显示降采样影响”的验收不变。
+
 ## 6. 技术依据
 
 线程亲和性与事件循环见 [Qt Threads and QObjects](https://doc.qt.io/qt-6/threads-qobject.html)，worker 回收见 [QThread](https://doc.qt.io/qt-6/qthread.html)，SQL 连接线程限制见 [QSqlDatabase](https://doc.qt.io/qt-6/qsqldatabase.html)。线程数量、队列上限和状态策略是本项目设计，非 Qt 的强制配置。
