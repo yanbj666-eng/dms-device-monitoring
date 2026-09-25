@@ -30,6 +30,12 @@ target_compile_features(tst_devicesession PRIVATE cxx_std_17)
 target_link_libraries(tst_devicesession PRIVATE dms_domain Qt6::Test)
 add_test(NAME tst_devicesession COMMAND tst_devicesession)
 
+# 设备管理器:装配/替换/启停/路由/信号转发(LLD §5)
+add_executable(tst_devicemanager tst_devicemanager.cpp)
+target_compile_features(tst_devicemanager PRIVATE cxx_std_17)
+target_link_libraries(tst_devicemanager PRIVATE dms_domain Qt6::Test)
+add_test(NAME tst_devicemanager COMMAND tst_devicemanager)
+
 # 配置装配层:devices.json + app.ini 全量校验(docs/15)
 add_executable(tst_config tst_config.cpp)
 target_compile_features(tst_config PRIVATE cxx_std_17)

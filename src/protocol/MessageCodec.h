@@ -2,6 +2,7 @@
 
 #include <QByteArray>
 #include <QList>
+#include <QMetaType>
 #include <QtGlobal>
 
 namespace dms::protocol {
@@ -91,3 +92,6 @@ public:
 };
 
 } // namespace dms::protocol
+
+// DeviceManager::sendCommand 跨线程 queued 传参需要(S4)
+Q_DECLARE_METATYPE(dms::protocol::CommandParam)
