@@ -10,7 +10,8 @@ project(dms
 set(CMAKE_AUTOMOC ON)
 
 # 语言标准不用全局 CMAKE_CXX_STANDARD,统一走 target_compile_features(target-based)
-find_package(Qt6 6.8 REQUIRED COMPONENTS Core Test)
+# Network:QTcpSocket/QTcpServer(S2 transport 与 simulator)
+find_package(Qt6 6.8 REQUIRED COMPONENTS Core Network Test)
 
 enable_testing()
 

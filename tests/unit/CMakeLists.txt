@@ -19,4 +19,10 @@ target_compile_features(tst_logging PRIVATE cxx_std_17)
 target_link_libraries(tst_logging PRIVATE dms_common Qt6::Test)
 add_test(NAME tst_logging COMMAND tst_logging)
 
+# QTcpServer 测试对端走 Qt6::Network(经 dms_transport PUBLIC 传递亦可,显式更清晰)
+add_executable(tst_tcptransport tst_tcptransport.cpp)
+target_compile_features(tst_tcptransport PRIVATE cxx_std_17)
+target_link_libraries(tst_tcptransport PRIVATE dms_transport Qt6::Network Qt6::Test)
+add_test(NAME tst_tcptransport COMMAND tst_tcptransport)
+
 # /utf-8 与警告选项已随 dms_protocol PUBLIC 传播

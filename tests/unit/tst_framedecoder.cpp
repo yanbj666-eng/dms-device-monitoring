@@ -151,6 +151,8 @@ void TestFrameDecoder::badCrcResyncKeepsNextFrame()
     const auto r = dec.decode(corrupted + hb); // 坏帧 + 好帧同块
     QCOMPARE(r.frames.size(), 1);
     QCOMPARE(r.badFrames, 1u);
+    QCOMPARE(r.badCrcFrames, 1u);   // 细分:CRC 错 -> FRAME_CRC 口径
+    QCOMPARE(r.badHeaderFrames, 0u);
     QCOMPARE(r.frames[0].seq, 1u);
 }
 
@@ -166,6 +168,8 @@ void TestFrameDecoder::invalidVersionResync()
     const auto r = dec.decode(bad + hb);
     QCOMPARE(r.frames.size(), 1);
     QCOMPARE(r.badFrames, 1u);
+    QCOMPARE(r.badHeaderFrames, 1u); // 细分:头非法 -> FRAME_LENGTH 口径
+    QCOMPARE(r.badCrcFrames, 0u);
     QCOMPARE(r.frames[0].seq, 1u);
 }
 

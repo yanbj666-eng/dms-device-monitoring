@@ -82,8 +82,9 @@ FrameDecoder::Result FrameDecoder::decode(const QByteArray &chunk)
 
         FrameHeader h;
         if (!FrameHeader::decode(d + consumed, h)) {
-            // 头非法:候选后一字节起重搜索(协议 §6)
+            // 头非法:候选后一字节起重搜索(协议 §6);上报口径为 FRAME_LENGTH
             ++r.badFrames;
+            ++r.badHeaderFrames;
             ++consumed;
             continue;
         }
@@ -100,6 +101,7 @@ FrameDecoder::Result FrameDecoder::decode(const QByteArray &chunk)
         if (Crc32::compute(frame, total - kCrcSize) != expect) {
             // CRC 错:同样候选 +1 重同步;坏帧不更新任何存活/指标时间(协议 §6)
             ++r.badFrames;
+            ++r.badCrcFrames;
             ++consumed;
             continue;
         }

@@ -2,3 +2,4 @@
 # transport/protocol/persistence 只依赖领域值类型/接口(HLD §1)
 add_subdirectory(common)
 add_subdirectory(protocol)
+add_subdirectory(transport)

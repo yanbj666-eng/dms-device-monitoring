@@ -26,7 +26,9 @@ public:
     {
         QList<DecodedFrame> frames;    // 本轮解出的已知类型帧,按到达顺序
         quint32 unknownTypeFrames = 0; // CRC 正确但类型未知,已消费跳过
-        quint32 badFrames = 0;         // 头非法或 CRC 错,已重同步
+        quint32 badFrames = 0;         // 头非法或 CRC 错的合计,已重同步
+        quint32 badHeaderFrames = 0;   // 合计中的头非法(版本/长度/时间戳)→ FRAME_LENGTH
+        quint32 badCrcFrames = 0;      // 合计中的 CRC 错 → FRAME_CRC(LLD §8 两种码要可区分)
         quint32 droppedBytes = 0;      // 无法构成帧而被丢弃的字节(含溢出清空)
         bool rxOverflow = false;      // 缓存超上限,已清空恢复
     };
