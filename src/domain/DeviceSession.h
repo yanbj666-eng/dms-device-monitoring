@@ -6,9 +6,14 @@
 #include <QString>
 #include <QUuid>
 
+#include <functional>
+
+#include "CommandTracker.h"
 #include "FrameDecoder.h"
 #include "MessageCodec.h"
 #include "transport/ITransport.h"
+
+class QTimer;
 
 namespace dms::domain {
 
@@ -20,31 +25,82 @@ struct TelemetryBatch {
     quint64 timestampMs = 0;                       // 发送端时间,0=未知
 };
 
-// 设备会话(S2 雏形):
-//   连接 -> FrameDecoder -> MessageCodec -> 值对象信号;
-//   计数与结构化错误进日志(LLD §8)。
-// 刻意不做的事(全部 S3):状态机(Online/Degraded/Reconnecting)、
-// 心跳/失联判定、自动重连与退避、组帧 2000ms 超时、命令生命周期。
+// 会话状态机状态(LLD §3)
+enum class SessionState {
+    Disconnected, // 人工断开/未启动
+    Connecting,   // 建链中或已打开等待首条有效消息
+    Online,       // 通信与四指标都健康
+    Degraded,     // 链路活着但指标过期/连续坏帧,通信继续
+    Reconnecting, // 失联,退避等待下一次尝试(只允许一个在途尝试)
+    Fault,        // 配置错误等不可恢复本地错误,停止重试等人工修正
+};
+
+inline QString sessionStateName(SessionState state)
+{
+    switch (state) {
+    case SessionState::Disconnected:  return QStringLiteral("Disconnected");
+    case SessionState::Connecting:    return QStringLiteral("Connecting");
+    case SessionState::Online:        return QStringLiteral("Online");
+    case SessionState::Degraded:      return QStringLiteral("Degraded");
+    case SessionState::Reconnecting:  return QStringLiteral("Reconnecting");
+    case SessionState::Fault:         return QStringLiteral("Fault");
+    }
+    return QStringLiteral("Unknown");
+}
+
+// 超时与重试参数(app.ini 可配,LLD §3);全部可注入,受控测试用假时钟驱动
+struct SessionConfig {
+    int pollIntervalMs = 100;           // 状态检查周期
+    int offlineTimeoutMs = 4000;        // 无有效接收 → 失联
+    int firstFrameTimeoutMs = 4000;     // 打开后无首个有效帧 → 重连
+    int metricTimeoutMs = 3000;         // 必需指标无更新 → Degraded
+    int frameAssemblyTimeoutMs = 2000;  // 组帧半包滞留上限
+    int commandAckTimeoutMs = 2000;     // 命令 ACK 超时
+    int consecutiveBadCrcLimit = 5;     // 连续 CRC 错 → Degraded
+    int goodFramesToRecoverOnline = 3;  // Degraded → Online 需连续有效帧
+    qint64 stableOnlineResetMs = 10000; // 稳定 Online 才清零重试计数
+    int reconnectBaseMs = 1000;         // 重试基数 1,2,4,8,10,10…s
+    int reconnectMinMs = 100;           // 抖动后下限 0.1s
+    int reconnectMaxMs = 10000;         // reconnect_max
+};
+
+// 设备会话(S3):连接 -> FrameDecoder -> MessageCodec -> 值对象信号,
+// 加上状态机(Online/Degraded/Reconnecting)、自动重连与退避、
+// 组帧 2000ms 超时、命令生命周期(LLD §3/§4)。
 //
 // 线程约定:会话与其 transport 同线程创建使用(IO 线程);
-// GUI 侧只连接信号消费值对象,不直接调方法(除 S4 以后加的快照接口)
+// GUI 侧只连接信号消费值对象,不直接调方法(除 S4 以后的快照接口)
 class DeviceSession : public QObject
 {
     Q_OBJECT
 
 public:
+    // 单调毫秒时钟与 ±10% 抖动源,均可注入(LLD §3"所有时间间隔用可注入时钟")
+    using Clock = std::function<qint64()>;
+    using JitterPercent = std::function<int()>; // 返回 -10..+10
+
     // 接管 transport 所有权(reparent 到本会话)
     DeviceSession(QString deviceId, dms::transport::ITransport *transport,
+                  SessionConfig config = SessionConfig(),
+                  Clock clock = DeviceSession::defaultClock,
+                  JitterPercent jitter = DeviceSession::defaultJitter,
                   QObject *parent = nullptr);
 
     QString deviceId() const { return deviceId_; }
     QUuid sessionId() const { return sessionId_; } // 本地每会话 UUID,不上帧(LLD §4)
+    SessionState state() const { return state_; }
 
-    void start(); // transport->open(),结果经 sessionOpened/sessionError
-    void stop();  // transport->close(),结果经 sessionClosed
+    void start(); // 人工连接 → Connecting;活动状态下重复 start 忽略
+    void stop();  // 人工断开 → Disconnected,取消定时器与未决命令
 
-    // S2 直通用(集成测试写命令);S3 命令生命周期接管后收编
-    dms::transport::ITransport *transport() const { return transport_; }
+    // 发命令并纳入生命周期(LLD §4):返回分配的 Seq,0 = 拒绝
+    // (状态不在 Online/Degraded、transport 不可写、已有未决命令)。
+    // 进展经 commandSent / commandFinished 异步报告,不自动重发。
+    quint32 sendCommand(quint16 commandId,
+                        const QList<dms::protocol::CommandParam> &params = {});
+
+    // 周期超时检查:内部 QTimer 驱动;测试注入假时钟后手动调用以推进时间
+    void checkTimeouts();
 
     // 计数:仅所属线程读;framesReceived 只含成功交付的帧
     quint64 framesReceived() const { return framesReceived_; }
@@ -53,28 +109,67 @@ public:
     quint32 unknownTypeFrames() const { return unknownTypeFrames_; }
     quint32 payloadErrors() const { return payloadErrors_; }
 
+    static qint64 defaultClock(); // steady_clock 毫秒(与 Logger 同源)
+    static int defaultJitter();   // QRandomGenerator 均匀取 -10..+10
+
 signals:
     void sessionOpened();
     void sessionClosed();
+    void stateChanged(dms::domain::SessionState newState);
     void heartbeatReceived(quint32 seq, quint64 timestampMs);
     // 结构合法的遥测(可能全是未知指标:samples 空 + unknownMetrics>0,
-    // 存活/新鲜度语义由 S3 状态机解释)
+    // 存活/新鲜度语义由状态机解释)
     void telemetryReceived(dms::domain::TelemetryBatch batch);
     // status 是 dms::protocol::AckStatus 的数值(quint16 直传,省一次 metatype)
     void commandAckReceived(quint32 seq, quint16 commandId, quint16 status);
+    void commandSent(quint32 seq, quint16 commandId);
+    void commandFinished(dms::domain::CommandOutcome outcome);
     void sessionError(dms::ErrorCode code, QString message);
 
 private:
+    void onTransportOpened();
+    void onTransportClosed();
+    void onWriteAccepted(quint64 requestId);
     void onBytesReceived(const QByteArray &bytes);
     void onTransportError(const dms::transport::TransportError &error);
     void handleTelemetry(const dms::protocol::DecodedFrame &frame);
     void handleCommandAck(const dms::protocol::DecodedFrame &frame);
+
+    void setState(SessionState next);
+    // 失联/建链失败/首帧超时的统一入口:取消未决命令、关旧 transport、排退避
+    void enterReconnecting(const QString &reason, dms::ErrorCode code);
+    qint64 backoffDelayMs() const;
+    // 任一有效帧(心跳/遥测/ACK,CRC 与载荷通过)的公共记账
+    void noteValidReceive();
+    void noteTelemetryMetrics(const QList<dms::protocol::TelemetrySample> &samples);
+    bool metricsAllFresh(qint64 now) const;
+    bool anyMetricStale(qint64 now) const;
+    void finishPending(std::optional<CommandOutcome> outcome);
     dms::LogContext logCtx(dms::ErrorCode code = dms::ErrorCode::None) const;
 
     QString deviceId_;
     QUuid sessionId_;
     dms::transport::ITransport *transport_ = nullptr;
     dms::protocol::FrameDecoder decoder_; // 每 Session 独立流缓存(LLD §2)
+    CommandTracker commands_;             // 命令生命周期(LLD §4)
+    QTimer *pollTimer_ = nullptr;         // start() 时在所属线程懒创建(线程红线)
+    SessionConfig config_;
+    Clock clock_;
+    JitterPercent jitter_;
+
+    SessionState state_ = SessionState::Disconnected;
+    // 状态机时间锚点(全部取自注入时钟)
+    qint64 openedAtMs_ = 0;           // 本轮 transport 打开时刻,0=从未打开
+    bool firstValidSeen_ = false;     // 本轮是否已见首条有效消息
+    qint64 lastValidReceiveMs_ = 0;   // 任一有效帧时刻,失联判定用
+    qint64 metricLastMs_[4] = {0, 0, 0, 0}; // 已知指标 1..4 的最后遥测时刻
+    qint64 partialSinceMs_ = 0;       // 组帧缓存开始滞留时刻,0=无半包
+    qint64 onlineStableSinceMs_ = 0;  // Online 起始时刻,稳定 10s 清零退避
+    qint64 retryAtMs_ = 0;            // 下一次重连尝试到期时刻
+    int reconnectAttempts_ = 0;       // 已点火的尝试次数,决定退避档位
+    int consecutiveBadCrc_ = 0;       // 连续 CRC 错,任一有效帧清零
+    int consecutiveGoodFrames_ = 0;   // Degraded 期间连续有效帧,Online 恢复用
+    bool closeByUs_ = false;          // 区分主动拆链与对端关闭
 
     quint64 framesReceived_ = 0;
     quint32 badCrcFrames_ = 0;
@@ -86,3 +181,5 @@ private:
 } // namespace dms::domain
 
 Q_DECLARE_METATYPE(dms::domain::TelemetryBatch)
+Q_DECLARE_METATYPE(dms::domain::SessionState)
+// CommandOutcome 的 Q_DECLARE_METATYPE 在 CommandTracker.h(避免重复特化)

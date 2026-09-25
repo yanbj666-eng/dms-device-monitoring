@@ -1,6 +1,7 @@
-# 领域层:设备会话(S2 雏形;状态机/命令生命周期 S3 接入)
+# 领域层:设备会话状态机 + 命令生命周期(LLD §3/§4)
 # 依赖方向(HLD §1):domain -> transport/protocol(common 为基础设施)
 add_library(dms_domain STATIC
+    CommandTracker.cpp
     DeviceSession.cpp
 )
 

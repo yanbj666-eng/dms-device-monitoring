@@ -1,6 +1,7 @@
-// tst_integration:S2 端到端集成测试
+// tst_integration:S2+S3 端到端集成测试
 // QProcess 拉起 dms_simulator 独立进程,真实 TCP 全链路:
-//   TcpTransport + DeviceSession vs 模拟设备(遥测/心跳/命令 ACK/多设备/故障注入)
+//   TcpTransport + DeviceSession(状态机/自动重连/命令生命周期)
+//   vs 模拟设备(遥测/心跳/命令 ACK/多设备/故障注入)
 //
 // 时序约定:模拟器故障时钟 0 点 = 设备构造时刻,略早于 SIM READY 行;
 // 测试以 READY 到达为本地锚点,因此"设备时刻 = 本地时刻 + δ(δ≥0,实测毫秒级)".
@@ -21,7 +22,10 @@
 #include "domain/DeviceSession.h"
 #include "transport/TcpTransport.h"
 
+using dms::domain::CommandOutcome;
+using dms::domain::CommandState;
 using dms::domain::DeviceSession;
+using dms::domain::SessionState;
 using dms::domain::TelemetryBatch;
 using dms::protocol::CommandParam;
 using dms::protocol::kValueTypeUint32;
@@ -146,23 +150,18 @@ CommandParam periodParam(quint32 ms)
     return CommandParam{1, kValueTypeUint32, raw}; // param_id=1:sample_period_ms
 }
 
-// S2 直通接口发命令:requestId 就用 Seq,方便对照(requestId 本身不断言)
-void sendCommand(DeviceSession &session, quint32 seq, quint16 commandId,
-                 const QList<CommandParam> &params = {})
+// 等会话进入 Online(首条四指标遥测即达,LLD §3 首条有效消息路径)
+void waitOnline(DeviceSession &session)
 {
-    session.transport()->write(
-        dms::protocol::encodeFrame(quint8(MessageType::Command), seq, 0,
-                                   MessageCodec::encodeCommand(commandId, params)),
-        seq);
+    QTRY_VERIFY_WITH_TIMEOUT(session.state() == SessionState::Online, 8000);
 }
 
-// 在 ACK spy 里按 Seq 回显找对应 ACK(协议 §4.3:只认 Seq 匹配,不认"任意 ACK")
-bool findAck(const QSignalSpy &spy, quint32 seq, quint16 &commandId, quint16 &status)
+// 在 commandFinished spy 里按 Seq 找结果;未终结返回 false
+bool findFinished(const QSignalSpy &spy, quint32 seq, CommandOutcome &out)
 {
     for (const QList<QVariant> &args : spy) {
-        if (args.at(0).toUInt() == seq) {
-            commandId = quint16(args.at(1).toUInt());
-            status = quint16(args.at(2).toUInt());
+        if (args.at(0).value<CommandOutcome>().seq == seq) {
+            out = args.at(0).value<CommandOutcome>();
             return true;
         }
     }
@@ -191,7 +190,9 @@ private slots:
     void faultStopSendingWindow();
     void faultDisconnectWindow();
     void faultAckNoReplyWindow();
+    void faultAckDelayWindow();
     void faultFragmentAndMergeWindows();
+    void faultOfflineRecovery();
 
 private:
     SimProcess sim_; // 每用例一个全新模拟器进程,状态隔离
@@ -262,39 +263,44 @@ void TestIntegration::commandAckLifecycle()
     auto *transport = new dms::transport::TcpTransport(cfg);
     DeviceSession session(cfg.deviceId, transport);
 
-    QSignalSpy openedSpy(&session, &DeviceSession::sessionOpened);
     QSignalSpy telSpy(&session, &DeviceSession::telemetryReceived);
     QSignalSpy hbSpy(&session, &DeviceSession::heartbeatReceived);
-    QSignalSpy ackSpy(&session, &DeviceSession::commandAckReceived);
+    QSignalSpy finishedSpy(&session, &DeviceSession::commandFinished);
 
     session.start();
-    QTRY_VERIFY_WITH_TIMEOUT(openedSpy.size() == 1, 8000);
+    waitOnline(session); // 命令仅在 Online/Degraded 下允许(LLD §4)
 
-    quint16 cmd = 0, status = 0;
+    CommandOutcome out;
 
     // 1) SetParameter(200) 合法:Success(周期随即降为 200ms)
-    sendCommand(session, 11, kCmdSetParameter, {periodParam(200)});
-    QTRY_VERIFY_WITH_TIMEOUT(findAck(ackSpy, 11, cmd, status), 3000);
-    QCOMPARE(cmd, quint16(kCmdSetParameter));
-    QCOMPARE(status, quint16(0));
+    quint32 seq = session.sendCommand(kCmdSetParameter, {periodParam(200)});
+    QVERIFY(seq != 0);
+    QTRY_VERIFY_WITH_TIMEOUT(findFinished(finishedSpy, seq, out), 3000);
+    QCOMPARE(out.state, CommandState::Succeeded);
+    QCOMPARE(out.ackStatus, quint16(0));
 
     // 2) 未知命令 99:结构可解析 -> 拒绝但回 ACK(协议 §4.2)
-    sendCommand(session, 12, 99);
-    QTRY_VERIFY_WITH_TIMEOUT(findAck(ackSpy, 12, cmd, status), 3000);
-    QCOMPARE(cmd, quint16(99));
-    QCOMPARE(status, quint16(1)); // Unsupported
+    seq = session.sendCommand(99);
+    QVERIFY(seq != 0);
+    QTRY_VERIFY_WITH_TIMEOUT(findFinished(finishedSpy, seq, out), 3000);
+    QCOMPARE(out.commandId, quint16(99));
+    QCOMPARE(out.state, CommandState::Rejected);
+    QCOMPARE(out.ackStatus, quint16(1)); // Unsupported
 
     // 3) SetParameter(50) 越界 -> BadParams
-    sendCommand(session, 13, kCmdSetParameter, {periodParam(50)});
-    QTRY_VERIFY_WITH_TIMEOUT(findAck(ackSpy, 13, cmd, status), 3000);
-    QCOMPARE(status, quint16(2)); // BadParams
+    seq = session.sendCommand(kCmdSetParameter, {periodParam(50)});
+    QVERIFY(seq != 0);
+    QTRY_VERIFY_WITH_TIMEOUT(findFinished(finishedSpy, seq, out), 3000);
+    QCOMPARE(out.state, CommandState::Rejected);
+    QCOMPARE(out.ackStatus, quint16(2)); // BadParams
 
     // 4) Stop:遥测静默,心跳照常。
     // TCP 保序:ACK 字节在 Stop 生效后发出,看到 ACK 时之前的遥测必然已交付,
     // 因此此刻 telSpy 计数就是终态,不存在"在路上的一帧"误判。
-    sendCommand(session, 14, kCmdStop);
-    QTRY_VERIFY_WITH_TIMEOUT(findAck(ackSpy, 14, cmd, status), 3000);
-    QCOMPARE(status, quint16(0));
+    seq = session.sendCommand(kCmdStop);
+    QVERIFY(seq != 0);
+    QTRY_VERIFY_WITH_TIMEOUT(findFinished(finishedSpy, seq, out), 3000);
+    QCOMPARE(out.state, CommandState::Succeeded);
     const int telAtStop = telSpy.size();
     const int hbAtStop = hbSpy.size();
     {
@@ -305,10 +311,11 @@ void TestIntegration::commandAckLifecycle()
     QCOMPARE(telSpy.size(), telAtStop);                      // 遥测确实停了
     QTRY_VERIFY_WITH_TIMEOUT(hbSpy.size() > hbAtStop, 3000); // 心跳仍在
 
-    // 5) Start:遥测恢复
-    sendCommand(session, 15, kCmdStart);
-    QTRY_VERIFY_WITH_TIMEOUT(findAck(ackSpy, 15, cmd, status), 3000);
-    QCOMPARE(status, quint16(0));
+    // 5) Start:遥测恢复(Stop 后无遥测,会话可能已 Degraded,命令仍允许)
+    seq = session.sendCommand(kCmdStart);
+    QVERIFY(seq != 0);
+    QTRY_VERIFY_WITH_TIMEOUT(findFinished(finishedSpy, seq, out), 3000);
+    QCOMPARE(out.state, CommandState::Succeeded);
     QTRY_VERIFY_WITH_TIMEOUT(telSpy.size() > telAtStop, 3000);
 }
 
@@ -341,7 +348,9 @@ void TestIntegration::multiDeviceConcurrency()
 
     QTRY_VERIFY_WITH_TIMEOUT(
         std::all_of(stacks.begin(), stacks.end(),
-                    [](const Stack &st) { return st.session->transport()->isOpen(); }),
+                    [](const Stack &st) {
+                        return st.session->state() == SessionState::Online;
+                    }),
         8000);
     QTRY_VERIFY_WITH_TIMEOUT(
         std::all_of(stacks.begin(), stacks.end(),
@@ -422,11 +431,15 @@ void TestIntegration::faultStopSendingWindow()
     const int telBefore = telSpy.size();
     QTRY_VERIFY_WITH_TIMEOUT(telSpy.size() >= telBefore + 2, 4000);
     QTRY_VERIFY_WITH_TIMEOUT(hbSpy.size() >= 1, 4000);
+
+    // 窗口 1.2s 远小于指标 3000ms/失联 4000ms:全程不降级不失联
+    QCOMPARE(session.state(), SessionState::Online);
 }
 
 void TestIntegration::faultDisconnectWindow()
 {
-    // 主动断开窗口 500-2000ms:开窗即刻拆链,窗口内新连接接受即拆
+    // 主动断开窗口 500-2000ms:开窗即刻拆链,窗口内新连接接受即拆。
+    // S3 自动重连:被踢 → Reconnecting(退避)→ 窗口结束后的尝试恢复 Online
     QVERIFY(sim_.start(1, 100, {QStringLiteral("-f"), QStringLiteral("disconnect@500+1500")}));
     QElapsedTimer clock;
     clock.start();
@@ -438,36 +451,28 @@ void TestIntegration::faultDisconnectWindow()
     auto *transport = new dms::transport::TcpTransport(cfg);
     DeviceSession session(cfg.deviceId, transport);
 
-    QSignalSpy openedSpy(&session, &DeviceSession::sessionOpened);
-    QSignalSpy closedSpy(&session, &DeviceSession::sessionClosed);
     QSignalSpy errSpy(&session, &DeviceSession::sessionError);
     QSignalSpy telSpy(&session, &DeviceSession::telemetryReceived);
     session.start();
-    QTRY_VERIFY_WITH_TIMEOUT(openedSpy.size() == 1, 8000);
-    QTRY_VERIFY_WITH_TIMEOUT(telSpy.size() >= 1, 5000);
+    waitOnline(session);
 
-    // 开窗被踢:closed 与结构化错误都要到
-    QTRY_VERIFY_WITH_TIMEOUT(closedSpy.size() >= 1, 4000);
+    // 开窗被踢:结构化错误 + 失联进 Reconnecting
     QTRY_VERIFY_WITH_TIMEOUT(errSpy.size() >= 1, 4000);
     QCOMPARE(errSpy.first().at(0).value<dms::ErrorCode>(), dms::ErrorCode::ConnectionLost);
+    QTRY_VERIFY_WITH_TIMEOUT(session.state() == SessionState::Reconnecting, 4000);
 
-    // 窗口内重连:TCP 先连上(opened),随即被故障拆除——generation 模式的实战演练
-    WAIT_UNTIL(clock, 1000);
-    session.start();
-    QTRY_VERIFY_WITH_TIMEOUT(openedSpy.size() >= 2, 4000);
-    QTRY_VERIFY_WITH_TIMEOUT(closedSpy.size() >= 2, 4000);
+    // 自动重连:窗口(设备时刻 ≤2000)结束后的某次尝试成功,恢复 Online。
+    // LLD §3:稳定可达端点恢复后 ≤15s Online
+    QTRY_VERIFY_WITH_TIMEOUT(session.state() == SessionState::Online, 15000);
 
-    // 窗口结束后重连成功,遥测恢复(transport 不做自动重连,由上层决策)
-    WAIT_UNTIL(clock, 2300);
-    session.start();
-    QTRY_VERIFY_WITH_TIMEOUT(openedSpy.size() >= 3, 4000);
+    // 恢复后遥测继续增长:链路是真的活着
     const int telBefore = telSpy.size();
     QTRY_VERIFY_WITH_TIMEOUT(telSpy.size() >= telBefore + 2, 4000);
 }
 
 void TestIntegration::faultAckNoReplyWindow()
 {
-    // ACK 不回窗口 500-2000ms:命令照常被吞掉 ACK(命令超时场景)
+    // ACK 不回窗口 500-2000ms:命令照常发出,ACK 被吞 → 2000ms 超时 TimedOut
     QVERIFY(sim_.start(1, 100, {QStringLiteral("-f"), QStringLiteral("ackNoReply@500+1500")}));
     QElapsedTimer clock;
     clock.start();
@@ -479,29 +484,31 @@ void TestIntegration::faultAckNoReplyWindow()
     auto *transport = new dms::transport::TcpTransport(cfg);
     DeviceSession session(cfg.deviceId, transport);
 
-    QSignalSpy openedSpy(&session, &DeviceSession::sessionOpened);
-    QSignalSpy ackSpy(&session, &DeviceSession::commandAckReceived);
+    QSignalSpy finishedSpy(&session, &DeviceSession::commandFinished);
     session.start();
-    QTRY_VERIFY_WITH_TIMEOUT(openedSpy.size() == 1, 8000);
+    waitOnline(session);
 
-    quint16 cmd = 0, status = 0;
+    CommandOutcome out;
 
     // 窗口前基线:正常 ACK 是毫秒级
-    sendCommand(session, 21, kCmdSetParameter, {periodParam(300)});
-    QTRY_VERIFY_WITH_TIMEOUT(findAck(ackSpy, 21, cmd, status), 3000);
-    QCOMPARE(status, quint16(0));
+    quint32 seq = session.sendCommand(kCmdSetParameter, {periodParam(300)});
+    QVERIFY(seq != 0);
+    QTRY_VERIFY_WITH_TIMEOUT(findFinished(finishedSpy, seq, out), 3000);
+    QCOMPARE(out.state, CommandState::Succeeded);
 
-    // 窗口内:等足 900ms 无 ACK(基线的几十倍),判定"不回"
+    // 窗口内:命令发出但 ACK 被吞,2000ms 后 TimedOut(执行结果未知,不重发)
     WAIT_UNTIL(clock, 800);
-    sendCommand(session, 22, kCmdSetParameter, {periodParam(400)});
-    WAIT_UNTIL(clock, 1700);
-    QVERIFY(!findAck(ackSpy, 22, cmd, status));
+    seq = session.sendCommand(kCmdSetParameter, {periodParam(400)});
+    QVERIFY(seq != 0);
+    QTRY_VERIFY_WITH_TIMEOUT(findFinished(finishedSpy, seq, out), 5000);
+    QCOMPARE(out.state, CommandState::TimedOut);
 
-    // 窗口结束:ACK 恢复(等 δ 余量后再发)
+    // 窗口结束:ACK 恢复(此命令发出时 TimedOut 已落地,窗口必已关闭)
     WAIT_UNTIL(clock, 2300);
-    sendCommand(session, 23, kCmdSetParameter, {periodParam(200)});
-    QTRY_VERIFY_WITH_TIMEOUT(findAck(ackSpy, 23, cmd, status), 4000);
-    QCOMPARE(status, quint16(0));
+    seq = session.sendCommand(kCmdSetParameter, {periodParam(200)});
+    QVERIFY(seq != 0);
+    QTRY_VERIFY_WITH_TIMEOUT(findFinished(finishedSpy, seq, out), 4000);
+    QCOMPARE(out.state, CommandState::Succeeded);
 }
 
 void TestIntegration::faultFragmentAndMergeWindows()
@@ -539,6 +546,67 @@ void TestIntegration::faultFragmentAndMergeWindows()
     QCOMPARE(session.badCrcFrames(), 0u);
     QCOMPARE(session.badHeaderFrames(), 0u);
     QCOMPARE(session.payloadErrors(), 0u);
+}
+
+void TestIntegration::faultAckDelayWindow()
+{
+    // ACK 延迟窗口 500-2000ms:ACK 迟到 500ms,仍在 2000ms 命令超时内 → Succeeded
+    QVERIFY(sim_.start(1, 100, {QStringLiteral("-f"), QStringLiteral("ackDelay@500+1500")}));
+    QElapsedTimer clock;
+    clock.start();
+
+    dms::transport::TcpTransportConfig cfg;
+    cfg.deviceId = QStringLiteral("itest-09");
+    cfg.host = QStringLiteral("127.0.0.1");
+    cfg.port = sim_.portAt(0);
+    auto *transport = new dms::transport::TcpTransport(cfg);
+    DeviceSession session(cfg.deviceId, transport);
+
+    QSignalSpy finishedSpy(&session, &DeviceSession::commandFinished);
+    session.start();
+    waitOnline(session);
+
+    CommandOutcome out;
+
+    // 窗口前基线
+    quint32 seq = session.sendCommand(kCmdSetParameter, {periodParam(300)});
+    QVERIFY(seq != 0);
+    QTRY_VERIFY_WITH_TIMEOUT(findFinished(finishedSpy, seq, out), 3000);
+    QCOMPARE(out.state, CommandState::Succeeded);
+
+    // 窗口中段发命令:ACK 延迟 500ms 回来,未超 2000ms 超时
+    WAIT_UNTIL(clock, 900);
+    seq = session.sendCommand(kCmdSetParameter, {periodParam(400)});
+    QVERIFY(seq != 0);
+    QTRY_VERIFY_WITH_TIMEOUT(findFinished(finishedSpy, seq, out), 4000);
+    QCOMPARE(out.state, CommandState::Succeeded);
+}
+
+void TestIntegration::faultOfflineRecovery()
+{
+    // 停发长窗 600-6600ms:指标过期 → Degraded;4000ms 无有效帧 → Reconnecting;
+    // 重连后窗口仍在(无首帧)再次退避;窗口结束后恢复 Online(自动重连全链路)
+    QVERIFY(sim_.start(1, 100, {QStringLiteral("-f"), QStringLiteral("stopSending@600+6000")}));
+    QElapsedTimer clock;
+    clock.start();
+
+    dms::transport::TcpTransportConfig cfg;
+    cfg.deviceId = QStringLiteral("itest-10");
+    cfg.host = QStringLiteral("127.0.0.1");
+    cfg.port = sim_.portAt(0);
+    auto *transport = new dms::transport::TcpTransport(cfg);
+    DeviceSession session(cfg.deviceId, transport);
+
+    session.start();
+    waitOnline(session);
+
+    // 四指标 3000ms 无更新:降级但链路活着(心跳也停了,存活判定靠最后一帧)
+    QTRY_VERIFY_WITH_TIMEOUT(session.state() == SessionState::Degraded, 6000);
+    // 4000ms 无有效接收:失联进 Reconnecting,自动退避重连
+    QTRY_VERIFY_WITH_TIMEOUT(session.state() == SessionState::Reconnecting, 8000);
+    // 窗口结束 + 自动重连成功:恢复 Online(LLD §3 稳定可达端点恢复后 ≤15s)
+    QTRY_VERIFY_WITH_TIMEOUT(session.state() == SessionState::Online, 20000);
+    QVERIFY(clock.elapsed() <= 22000); // 总预算(含开窗 600ms 与 δ)
 }
 
 QTEST_MAIN(TestIntegration)
