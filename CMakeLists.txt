@@ -16,4 +16,5 @@ find_package(Qt6 6.8 REQUIRED COMPONENTS Core Network Test)
 enable_testing()
 
 add_subdirectory(src)
+add_subdirectory(simulator)
 add_subdirectory(tests)

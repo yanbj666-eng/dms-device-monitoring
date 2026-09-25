@@ -1,0 +1,11 @@
+# TCP 设备模拟器(S2):复用协议层编码,单事件循环服务全部设备。
+# 设备侧不走 ITransport(那是客户端抽象),直接用 QTcpServer
+add_executable(dms_simulator
+    DeviceSimulator.cpp
+    main.cpp
+)
+
+target_compile_features(dms_simulator PRIVATE cxx_std_17)
+target_link_libraries(dms_simulator PRIVATE dms_protocol dms_common Qt6::Core Qt6::Network)
+
+# /utf-8、/W4 经 dms_common PUBLIC 传播,这里只补连接库
