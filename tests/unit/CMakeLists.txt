@@ -14,4 +14,9 @@ target_compile_features(tst_messagecodec PRIVATE cxx_std_17)
 target_link_libraries(tst_messagecodec PRIVATE dms_protocol Qt6::Test)
 add_test(NAME tst_messagecodec COMMAND tst_messagecodec)
 
+add_executable(tst_logging tst_logging.cpp)
+target_compile_features(tst_logging PRIVATE cxx_std_17)
+target_link_libraries(tst_logging PRIVATE dms_common Qt6::Test)
+add_test(NAME tst_logging COMMAND tst_logging)
+
 # /utf-8 与警告选项已随 dms_protocol PUBLIC 传播
