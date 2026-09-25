@@ -70,6 +70,7 @@ void DeviceSession::start()
     // Disconnected,或 Fault 经人工修正后重启:全新一轮(LLD §3)
     reconnectAttempts_ = 0;
     retryAtMs_ = 0;
+    openedAtMs_ = 0; // 清上一轮打开时刻:首帧超时判定只属于本轮
     setState(SessionState::Connecting);
     if (!pollTimer_) {
         // start() 总在会话所属线程被调(worker 启动槽),timer 与会话同线程
@@ -182,6 +183,9 @@ void DeviceSession::checkTimeouts()
     case SessionState::Reconnecting:
         if (now >= retryAtMs_) {
             ++reconnectAttempts_; // 本次尝试点火(只允许一个在途尝试)
+            // 新尝试尚未打开:必须清上一轮的打开时刻,否则异步建链期间
+            // 首个 poll tick 就拿陈旧时间戳误判"无首帧超时",掩盖真实错误
+            openedAtMs_ = 0;
             setState(SessionState::Connecting);
             transport_->open();
         }

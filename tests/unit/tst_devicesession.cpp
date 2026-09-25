@@ -58,6 +58,7 @@ public:
 
     void feed(const QByteArray &bytes) { emit bytesReceived(bytes); }
     void injectError(dms::transport::TransportError e) { emit errorOccurred(e); }
+    void completeOpen() { emit opened(); } // deferOpen 后异步补发"握手完成"
 };
 
 QByteArray telemetryFrame(quint32 seq, quint64 ts, const QList<TelemetrySample> &samples,
@@ -173,6 +174,7 @@ private slots:
     void configInvalidGoesFaultAndNoRetry();
     void frameAssemblyTimeoutDiscardsStaleHalf();
     void seqContinuesAcrossReconnect();
+    void reconnectAttemptNotKilledByStaleOpenTimestamp();
 
     // ---- S3:命令生命周期 ----
     void commandRoundTripSucceeded();
@@ -558,6 +560,31 @@ void TestDeviceSession::peerCloseReconnects()
 
     rig.transport->close(); // 非主动拆链(closeByUs_ 为 false)
 
+    QCOMPARE(rig.session->state(), SessionState::Reconnecting);
+}
+
+// S4 冒烟发现:重连点火时若不清上一轮 openedAtMs_,异步建链(打开回调
+// 未到)期间首个 poll tick 就拿陈旧时间戳误判"无首帧超时",把真实连接
+// 错误(如连接拒绝)掩盖成 FRAME_TIMEOUT
+void TestDeviceSession::reconnectAttemptNotKilledByStaleOpenTimestamp()
+{
+    Rig rig;
+    rig.goOnline(); // 本轮 openedAtMs_ 已置位
+
+    rig.advance(4100); // 失联 → Reconnecting(首档退避 1s)
+    QCOMPARE(rig.session->state(), SessionState::Reconnecting);
+
+    rig.transport->deferOpen = true; // 模拟异步建链:open 后 opened 迟迟不来
+    rig.advance(1000);               // 重试点火 → Connecting
+    QCOMPARE(rig.session->state(), SessionState::Connecting);
+
+    rig.advance(100); // 一个 poll tick:不得被陈旧时间戳误杀
+    QCOMPARE(rig.session->state(), SessionState::Connecting);
+
+    rig.transport->completeOpen(); // 握手完成,首帧窗口从现在起算
+    rig.advance(3999);
+    QCOMPARE(rig.session->state(), SessionState::Connecting);
+    rig.advance(1); // 打开后 4000ms 无首帧:真实超时仍然生效
     QCOMPARE(rig.session->state(), SessionState::Reconnecting);
 }
 
