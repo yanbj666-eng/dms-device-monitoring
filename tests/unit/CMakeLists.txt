@@ -25,4 +25,9 @@ target_compile_features(tst_tcptransport PRIVATE cxx_std_17)
 target_link_libraries(tst_tcptransport PRIVATE dms_transport Qt6::Network Qt6::Test)
 add_test(NAME tst_tcptransport COMMAND tst_tcptransport)
 
+add_executable(tst_devicesession tst_devicesession.cpp)
+target_compile_features(tst_devicesession PRIVATE cxx_std_17)
+target_link_libraries(tst_devicesession PRIVATE dms_domain Qt6::Test)
+add_test(NAME tst_devicesession COMMAND tst_devicesession)
+
 # /utf-8 与警告选项已随 dms_protocol PUBLIC 传播
