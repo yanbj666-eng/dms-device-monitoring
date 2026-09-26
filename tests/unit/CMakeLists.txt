@@ -42,4 +42,10 @@ target_compile_features(tst_config PRIVATE cxx_std_17)
 target_link_libraries(tst_config PRIVATE dms_app Qt6::Test)
 add_test(NAME tst_config COMMAND tst_config)
 
+# 持久化基础:SQLite 建库/版本检查/启动恢复/约束(docs/06)
+add_executable(tst_database tst_database.cpp)
+target_compile_features(tst_database PRIVATE cxx_std_17)
+target_link_libraries(tst_database PRIVATE dms_persistence Qt6::Sql Qt6::Test)
+add_test(NAME tst_database COMMAND tst_database)
+
 # /utf-8 与警告选项已随 dms_protocol PUBLIC 传播

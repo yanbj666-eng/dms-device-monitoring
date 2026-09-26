@@ -12,7 +12,8 @@ set(CMAKE_AUTOMOC ON)
 # 语言标准不用全局 CMAKE_CXX_STANDARD,统一走 target_compile_features(target-based)
 # Network:QTcpSocket/QTcpServer(S2 transport 与 simulator)
 # Widgets:S4 最小 UI(GUI 随 Widgets 传递引入)
-find_package(Qt6 6.8 REQUIRED COMPONENTS Core Network Test Widgets)
+# Sql:QSqlDatabase/QSQLITE(S5 持久化)
+find_package(Qt6 6.8 REQUIRED COMPONENTS Core Network Test Widgets Sql)
 
 enable_testing()
 
