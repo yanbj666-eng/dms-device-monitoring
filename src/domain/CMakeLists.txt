@@ -1,6 +1,7 @@
-# 领域层:设备会话状态机 + 命令生命周期 + 设备管理器(LLD §3/§4/§5)
+# 领域层:设备会话状态机 + 命令生命周期 + 设备管理器 + 告警引擎(LLD §3/§4/§5/§6)
 # 依赖方向(HLD §1):domain -> transport/protocol(common 为基础设施)
 add_library(dms_domain STATIC
+    AlarmEngine.cpp
     CommandTracker.cpp
     DeviceManager.cpp
     DeviceSession.cpp

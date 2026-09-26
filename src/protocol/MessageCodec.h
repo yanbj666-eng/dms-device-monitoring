@@ -49,6 +49,15 @@ struct TelemetryResult {
 };
 
 // ---- COMMAND(客户端 -> 设备,协议 §4.2)----
+// 命令号:模拟器/会话/告警引擎三方共用,收敛到协议层避免各处魔数漂移
+namespace CommandId {
+inline constexpr quint16 Start        = 1; // 恢复遥测采集
+inline constexpr quint16 Stop         = 2; // 停止遥测采集(心跳与 ACK 照常)
+inline constexpr quint16 Reset        = 3; // 复位业务参数/计数
+inline constexpr quint16 SetParameter = 4; // param_id=1: sample_period_ms
+} // namespace CommandId
+
+// ---- COMMAND 载荷 ----
 struct CommandParam {
     quint16 id = 0;     // 独立于遥测的命令参数空间
     quint8 valueType = 0;

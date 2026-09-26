@@ -36,6 +36,12 @@ target_compile_features(tst_devicemanager PRIVATE cxx_std_17)
 target_link_libraries(tst_devicemanager PRIVATE dms_domain Qt6::Test)
 add_test(NAME tst_devicemanager COMMAND tst_devicemanager)
 
+# 告警引擎:阈值/迟滞/去重/独立确认/陈旧/CRC/失联生命周期(LLD §6)
+add_executable(tst_alarmengine tst_alarmengine.cpp)
+target_compile_features(tst_alarmengine PRIVATE cxx_std_17)
+target_link_libraries(tst_alarmengine PRIVATE dms_domain Qt6::Test)
+add_test(NAME tst_alarmengine COMMAND tst_alarmengine)
+
 # 配置装配层:devices.json + app.ini 全量校验(docs/15)
 add_executable(tst_config tst_config.cpp)
 target_compile_features(tst_config PRIVATE cxx_std_17)
