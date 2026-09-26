@@ -23,6 +23,7 @@ struct TelemetryBatch {
     quint32 unknownMetrics = 0;                    // 结构合法的未知指标计数
     quint32 seq = 0;                               // 发送端帧序号
     quint64 timestampMs = 0;                       // 发送端时间,0=未知
+    QUuid sessionId;                               // 本地会话标识,入库唯一键用(S5)
 };
 
 // 会话状态机状态(LLD §3)

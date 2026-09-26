@@ -2,6 +2,7 @@
 # 依赖方向(HLD §1):persistence 只用领域值类型与 common 基础设施,由 app 组合
 add_library(dms_persistence STATIC
     Database.cpp
+    DatabaseWorker.cpp
 )
 
 target_include_directories(dms_persistence PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

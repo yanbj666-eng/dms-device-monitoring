@@ -48,4 +48,10 @@ target_compile_features(tst_database PRIVATE cxx_std_17)
 target_link_libraries(tst_database PRIVATE dms_persistence Qt6::Sql Qt6::Test)
 add_test(NAME tst_database COMMAND tst_database)
 
+# DB worker:批量双触发/失败重试/队列上限/命令事件/排空(LLD §7)
+add_executable(tst_databaseworker tst_databaseworker.cpp)
+target_compile_features(tst_databaseworker PRIVATE cxx_std_17)
+target_link_libraries(tst_databaseworker PRIVATE dms_persistence Qt6::Sql Qt6::Test)
+add_test(NAME tst_databaseworker COMMAND tst_databaseworker)
+
 # /utf-8 与警告选项已随 dms_protocol PUBLIC 传播

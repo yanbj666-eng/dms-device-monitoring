@@ -22,6 +22,16 @@ struct DeviceSetup {
     bool connectOnStart = true;
 };
 
+// 命令受理记录(S5 持久化用):sendCommand 被会话受理后发射,
+// DB worker 据此落 commands 表 Sent 行;终态经 deviceCommandFinished 补全
+struct CommandSubmission {
+    QString deviceId;
+    QUuid sessionId;
+    quint32 seq = 0;
+    quint16 commandId = 0;
+    QList<dms::protocol::CommandParam> params;
+};
+
 // 设备管理器(LLD §5):IO 线程 worker-object,拥有全部 DeviceSession,
 // 负责配置快照、统一启停与命令路由。
 //
@@ -64,6 +74,9 @@ signals:
     void deviceCommandFinished(QString deviceId, dms::domain::CommandOutcome outcome);
     void deviceError(QString deviceId, dms::ErrorCode code, QString message);
     void commandRejected(QString deviceId, quint16 commandId, QString reason);
+    // 会话受理了命令(Sent 起点):比 deviceCommandSent 多带 params 与
+    // sessionId,供 DB worker 写 commands 表(S5)
+    void commandSubmitted(dms::domain::CommandSubmission submission);
     void managerStopped(); // stopAll 完成(退出序列的同步点)
 
 private:
@@ -77,3 +90,4 @@ private:
 } // namespace dms::domain
 
 Q_DECLARE_METATYPE(dms::domain::DeviceSetup)
+Q_DECLARE_METATYPE(dms::domain::CommandSubmission)

@@ -318,6 +318,7 @@ void DeviceSession::handleTelemetry(const DecodedFrame &frame)
     batch.unknownMetrics = result.unknownMetrics;
     batch.seq = frame.seq;
     batch.timestampMs = frame.timestampMs;
+    batch.sessionId = sessionId_;
     emit telemetryReceived(batch);
 }
 
@@ -466,8 +467,10 @@ qint64 DeviceSession::backoffDelayMs() const
 
 void DeviceSession::finishPending(std::optional<CommandOutcome> outcome)
 {
-    if (outcome)
+    if (outcome) {
+        outcome->sessionId = sessionId_; // 入库按会话定位唯一键(S5)
         emit commandFinished(*outcome);
+    }
 }
 
 dms::LogContext DeviceSession::logCtx(dms::ErrorCode code) const

@@ -12,6 +12,7 @@ DeviceManager::DeviceManager(QObject *parent)
     qRegisterMetaType<QList<dms::domain::DeviceSetup>>("QList<dms::domain::DeviceSetup>");
     qRegisterMetaType<QList<dms::protocol::CommandParam>>(
         "QList<dms::protocol::CommandParam>");
+    qRegisterMetaType<dms::domain::CommandSubmission>("dms::domain::CommandSubmission");
 
     // 默认工厂:S4 仅 TCP;transport 配置里的 deviceId 只用于日志上下文
     transportFactory_ = [](const DeviceSetup &setup) {
@@ -115,7 +116,16 @@ void DeviceManager::sendCommand(QString deviceId, quint16 commandId,
         // Session 拒绝:状态不在 Online/Degraded、transport 不可写或已有未决命令
         emit commandRejected(deviceId, commandId,
                              QStringLiteral("会话不受理(状态/未决命令/不可写)"));
+        return;
     }
+    // 受理即广播完整记录:commands 表 Sent 行所需的全部字段(S5)
+    CommandSubmission submission;
+    submission.deviceId = deviceId;
+    submission.sessionId = session->sessionId();
+    submission.seq = seq;
+    submission.commandId = commandId;
+    submission.params = params;
+    emit commandSubmitted(submission);
 }
 
 void DeviceManager::createSession(const DeviceSetup &setup)

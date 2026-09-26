@@ -2,6 +2,7 @@
 
 #include <QMetaType>
 #include <QString>
+#include <QUuid>
 #include <QtGlobal>
 
 #include <optional>
@@ -38,6 +39,7 @@ struct CommandOutcome {
     CommandState state = CommandState::Sent;
     quint16 ackStatus = 0; // AckStatus 数值,仅 Succeeded/Rejected 有意义
     QString detail;        // Failed/Cancelled 的原因
+    QUuid sessionId;       // 命令所属会话,入库唯一键用(S5)
 };
 
 // 命令生命周期跟踪(LLD §4):
