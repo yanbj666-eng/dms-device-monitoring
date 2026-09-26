@@ -138,14 +138,8 @@ DbInitResult Database::initialize(const QString &absoluteFilePath, int busyTimeo
 
     DbInitResult opened = openConnection(absoluteFilePath, busyTimeoutMs);
     if (!opened.ok) {
-        // openConnection 失败时连接名已登记(addDatabase 无条件登记),
-        // 这里补注销,避免 QSqlDatabase 注册表泄漏
-        {
-            QSqlDatabase db = QSqlDatabase::database(connectionName_, false);
-            if (db.isValid())
-                db.close();
-        }
-        QSqlDatabase::removeDatabase(connectionName_);
+        // openConnection 失败时连接名已登记(addDatabase 无条件登记),补注销
+        releaseConnection();
         return opened;
     }
     open_ = true;
@@ -338,13 +332,69 @@ void Database::close()
     if (!open_)
         return;
     open_ = false;
+    releaseConnection();
+}
+
+void Database::releaseConnection()
+{
+    // 先让局部句柄析构再 removeDatabase:查询对象都是方法局部变量,
+    // 违反此序会触发"connection is still in use"悬空警告(docs/06 §2)
     {
-        // 先让局部句柄析构,再 removeDatabase:查询对象必须先于连接注销销毁
         QSqlDatabase db = QSqlDatabase::database(connectionName_, false);
         if (db.isValid())
             db.close();
     }
     QSqlDatabase::removeDatabase(connectionName_);
+}
+
+// 只读打开既有库(查询/导出连接,docs/06 §3):
+//   - 读者不得静默创建空库:SQLite 默认会建文件,先做存在性检查;
+//   - 只设 busy_timeout(读也可能撞上写事务/checkpoint)与 query_only
+//     (引擎级挡住误写);不动 journal/synchronous,不做建库/恢复/镜像;
+//   - 版本与写路径同规则:user_version 不等于支持的版本拒绝解释(docs/06 §4)
+DbInitResult Database::openExisting(const QString &absoluteFilePath, int busyTimeoutMs)
+{
+    close();
+
+    if (!QFileInfo::exists(absoluteFilePath))
+        return DbInitResult{false, dms::ErrorCode::DbReadFailed,
+                            QStringLiteral("数据库文件不存在: %1").arg(absoluteFilePath)};
+
+    {
+        QSqlDatabase db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connectionName_);
+        db.setDatabaseName(absoluteFilePath);
+        if (!db.open()) {
+            const QString text = db.lastError().text();
+            releaseConnection();
+            return DbInitResult{false, dms::ErrorCode::DbReadFailed,
+                                QStringLiteral("打开数据库失败: %1").arg(text)};
+        }
+    } // db 句柄离开作用域析构,后续 removeDatabase 才无悬空警告
+
+    QString error;
+    if (!execStatement(sql(), QStringLiteral("PRAGMA busy_timeout = %1").arg(busyTimeoutMs),
+                       &error)
+        || readPragma(sql(), QStringLiteral("PRAGMA busy_timeout")).toInt() != busyTimeoutMs) {
+        releaseConnection();
+        return DbInitResult{false, dms::ErrorCode::DbReadFailed,
+                            QStringLiteral("设置 busy_timeout 失败: %1").arg(error)};
+    }
+    if (!execStatement(sql(), QStringLiteral("PRAGMA query_only = ON"), &error)
+        || readPragma(sql(), QStringLiteral("PRAGMA query_only")).toInt() != 1) {
+        releaseConnection();
+        return DbInitResult{false, dms::ErrorCode::DbReadFailed,
+                            QStringLiteral("启用 query_only 失败: %1").arg(error)};
+    }
+
+    const int version = readPragma(sql(), QStringLiteral("PRAGMA user_version")).toInt();
+    if (version != schemaVersion) {
+        releaseConnection();
+        return DbInitResult{false, dms::ErrorCode::DbSchemaUnsupported,
+                            QStringLiteral("user_version=%1 与支持的版本 %2 不符,拒绝读取")
+                                .arg(version).arg(schemaVersion)};
+    }
+    open_ = true;
+    return DbInitResult{true, dms::ErrorCode::None, QString()};
 }
 
 } // namespace dms::persistence

@@ -93,6 +93,7 @@ QString errorCodeName(ErrorCode code)
     case ErrorCode::SendQueueFull:       return QStringLiteral("SEND_QUEUE_FULL");
     case ErrorCode::CommandTimeout:      return QStringLiteral("COMMAND_TIMEOUT");
     case ErrorCode::DbWriteFailed:       return QStringLiteral("DB_WRITE_FAILED");
+    case ErrorCode::DbReadFailed:        return QStringLiteral("DB_READ_FAILED");
     case ErrorCode::DbQueueFull:         return QStringLiteral("DB_QUEUE_FULL");
     case ErrorCode::DbSchemaUnsupported: return QStringLiteral("DB_SCHEMA_UNSUPPORTED");
     case ErrorCode::None: break;

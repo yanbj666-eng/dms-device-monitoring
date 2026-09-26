@@ -34,7 +34,9 @@ struct DbInitResult {
 //     Qt 只有 deferred BEGIN,读升写锁遇 BUSY_SNAPSHOT 不受 busy_timeout
 //     重试保护;IMMEDIATE 一开始就取写锁,锁忙由 busy_timeout 兜住。
 // schema v1 职责(docs/06 §4):首次建库 / user_version 检查 /
-// 启动恢复(遗留命令 Interrupted、活跃告警 restart 关闭)/ 设备 upsert
+// 启动恢复(遗留命令 Interrupted、活跃告警 restart 关闭)/ 设备 upsert。
+// openExisting 是只读打开(docs/06 §3):查询/导出连接专用,不建库不恢复不镜像,
+// query_only 在引擎层挡住误写;与写连接(DatabaseWorker)并发由 WAL 保证
 class Database
 {
 public:
@@ -48,6 +50,10 @@ public:
     // 设备 upsert。失败时保留错误与磁盘原状,不删除重建(docs/06 §4)
     DbInitResult initialize(const QString &absoluteFilePath, int busyTimeoutMs,
                             const QList<DeviceRow> &devices);
+
+    // 只读打开既有库:文件必须已存在(不静默创建),版本必须匹配;
+    // 只设 busy_timeout 与 query_only,不改库内容
+    DbInitResult openExisting(const QString &absoluteFilePath, int busyTimeoutMs);
 
     void close();
     bool isOpen() const { return open_; }
@@ -67,6 +73,7 @@ private:
     DbInitResult initSchema();     // user_version=0 且无业务表时建库
     DbInitResult recoverOnStart(); // 遗留 Pending/Sent 命令与活跃告警
     DbInitResult upsertDevices(const QList<DeviceRow> &devices);
+    void releaseConnection();      // 关闭并注销连接注册(打开失败也要注销)
 
     QString connectionName_;
     bool open_ = false;

@@ -17,7 +17,7 @@ enum class LogLevel { Debug, Info, Warn, Error };
 // ---- 日志分类(LLD §8)----
 enum class LogCategory { App, Net, Serial, Protocol, Db, Ui, Test };
 
-// ---- 错误码(LLD §8 十三种;transport/protocol/db 共用,故放 common)----
+// ---- 错误码(LLD §8 基础十三种 + S5 读路径补充;transport/protocol/db 共用,故放 common)----
 enum class ErrorCode {
     None = 0,
     ConfigInvalid,       // CONFIG_INVALID
@@ -33,6 +33,7 @@ enum class ErrorCode {
     DbWriteFailed,       // DB_WRITE_FAILED
     DbQueueFull,         // DB_QUEUE_FULL
     DbSchemaUnsupported, // DB_SCHEMA_UNSUPPORTED
+    DbReadFailed,        // DB_READ_FAILED(S5:查询/导出/只读打开失败)
 };
 
 // 日志/测试断言用的可读名

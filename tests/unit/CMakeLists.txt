@@ -54,4 +54,10 @@ target_compile_features(tst_databaseworker PRIVATE cxx_std_17)
 target_link_libraries(tst_databaseworker PRIVATE dms_persistence Qt6::Sql Qt6::Test)
 add_test(NAME tst_databaseworker COMMAND tst_databaseworker)
 
+# 历史查询与 CSV 导出:游标分页/边界快照/转义/原子替换(docs/06 §3,TC-DB-007)
+add_executable(tst_repository tst_repository.cpp)
+target_compile_features(tst_repository PRIVATE cxx_std_17)
+target_link_libraries(tst_repository PRIVATE dms_persistence Qt6::Sql Qt6::Test)
+add_test(NAME tst_repository COMMAND tst_repository)
+
 # /utf-8 与警告选项已随 dms_protocol PUBLIC 传播
