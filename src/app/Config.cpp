@@ -395,6 +395,9 @@ void parseDevicesJson(const QByteArray &bytes, QList<DeviceConnectionConfig> *de
                 continue;
             }
         }
+        // 原始对象随快照保留:DB 侧 config_json 镜像用,语义与源对象一致
+        cfg.rawJson = QString::fromUtf8(
+            QJsonDocument(item.toObject()).toJson(QJsonDocument::Compact));
         devices->append(cfg);
     }
 }

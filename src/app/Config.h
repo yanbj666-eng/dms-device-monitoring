@@ -30,6 +30,9 @@ struct DeviceConnectionConfig {
     QString host;
     quint16 port = 0;
     QList<AlarmRuleConfig> alarmRules;
+    // 原始对象紧凑文本(重新序列化,键序可能与源文件不同):
+    // devices 表 config_json 镜像用,不掺默认值(docs/06 §1,S5 消费)
+    QString rawJson;
 };
 
 // app.ini 全部节的解析结果,已按归属拆到各模块配置值对象;

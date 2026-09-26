@@ -1,6 +1,8 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QTemporaryDir>
 #include <QtTest>
 
@@ -161,6 +163,12 @@ void TestConfig::templateFirstRun()
     QCOMPARE(tcp.alarmRules.size(), 1);
     QCOMPARE(tcp.alarmRules[0].metricId, quint16(1));
     QCOMPARE(tcp.alarmRules[0].high, 80.0);
+
+    // rawJson:原始对象紧凑文本(devices 表 config_json 镜像用,S5)
+    const QJsonObject raw = QJsonDocument::fromJson(tcp.rawJson.toUtf8()).object();
+    QCOMPARE(raw.value(QStringLiteral("id")).toString(), QStringLiteral("sim-tcp-01"));
+    QCOMPARE(raw.value(QStringLiteral("port")).toInt(), 9001);
+    QVERIFY(!tcp.rawJson.contains(QLatin1Char('\n'))); // 紧凑单行
 
     // 第二次加载:文件已存在,不再视为首启
     const LoadedConfig again = loadConfiguration(runRoot.path(), templateDir.filePath("config"));

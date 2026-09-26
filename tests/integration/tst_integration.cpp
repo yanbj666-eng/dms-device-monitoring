@@ -11,6 +11,9 @@
 #include <QElapsedTimer>
 #include <QProcess>
 #include <QTcpServer>
+#include <QSqlError>
+#include <QSqlQuery>
+#include <QTemporaryDir>
 #include <QtEndian>
 
 #include <algorithm>
@@ -19,14 +22,23 @@
 
 #include "Frame.h"
 #include "MessageCodec.h"
+#include "domain/DeviceManager.h"
 #include "domain/DeviceSession.h"
+#include "persistence/Database.h"
+#include "persistence/DatabaseWorker.h"
+#include "persistence/Repository.h"
 #include "transport/TcpTransport.h"
 
 using dms::domain::CommandOutcome;
 using dms::domain::CommandState;
+using dms::domain::DeviceManager;
 using dms::domain::DeviceSession;
 using dms::domain::SessionState;
 using dms::domain::TelemetryBatch;
+using dms::persistence::Database;
+using dms::persistence::DatabaseWorker;
+using dms::persistence::DeviceRow;
+using dms::persistence::Repository;
 using dms::protocol::CommandParam;
 using dms::protocol::kValueTypeUint32;
 using dms::protocol::MessageCodec;
@@ -193,6 +205,7 @@ private slots:
     void faultAckDelayWindow();
     void faultFragmentAndMergeWindows();
     void faultOfflineRecovery();
+    void persistenceRoundTrip();
 
 private:
     SimProcess sim_; // 每用例一个全新模拟器进程,状态隔离
@@ -607,6 +620,124 @@ void TestIntegration::faultOfflineRecovery()
     // 窗口结束 + 自动重连成功:恢复 Online(LLD §3 稳定可达端点恢复后 ≤15s)
     QTRY_VERIFY_WITH_TIMEOUT(session.state() == SessionState::Online, 20000);
     QVERIFY(clock.elapsed() <= 22000); // 总预算(含开窗 600ms 与 δ)
+}
+
+// S5 端到端:模拟器 → TCP → DeviceManager → DatabaseWorker → SQLite,
+// 再经 Repository 只读连接读回校验;含命令 Sent→Succeeded 全生命周期。
+// 线程跳变(GUI/IO/DB 三线程)已在装配与单元层覆盖,此处同线程直连验数据链路
+void TestIntegration::persistenceRoundTrip()
+{
+    QVERIFY(sim_.start(1, 100, {}));
+
+    dms::domain::DeviceSetup setup;
+    setup.deviceId = QStringLiteral("itest-07");
+    setup.transport.deviceId = setup.deviceId;
+    setup.transport.host = QStringLiteral("127.0.0.1");
+    setup.transport.port = sim_.portAt(0);
+    DeviceManager manager;
+
+    QTemporaryDir dir;
+    dms::persistence::DbWorkerSettings settings;
+    settings.databasePath = dir.filePath(QStringLiteral("e2e.db"));
+    settings.batchSamples = 8; // 两帧即达批阈值
+    settings.flushIntervalMs = 200;
+    settings.queueSamples = 5000;
+    settings.eventQueueSize = 100;
+    settings.busyTimeoutMs = 200;
+    settings.shutdownFlushMs = 3000;
+
+    DatabaseWorker worker(settings);
+    DeviceRow row;
+    row.id = QStringLiteral("itest-07");
+    row.name = QStringLiteral("集成设备");
+    row.transportType = QStringLiteral("tcp");
+    row.configJson = QStringLiteral("{\"id\":\"itest-07\"}");
+    worker.initialize({row});
+
+    // 先接管线再放采集:漏掉的前几帧不会入库,断言只数已入库的
+    QObject::connect(&manager, &DeviceManager::deviceTelemetry, &worker,
+                     &DatabaseWorker::onTelemetry);
+    QObject::connect(&manager, &DeviceManager::commandSubmitted, &worker,
+                     &DatabaseWorker::onCommandSubmitted);
+    QObject::connect(&manager, &DeviceManager::deviceCommandFinished, &worker,
+                     &DatabaseWorker::onCommandFinished);
+
+    QSignalSpy telSpy(&manager, &DeviceManager::deviceTelemetry);
+    QSignalSpy finishedSpy(&manager, &DeviceManager::deviceCommandFinished);
+    QSignalSpy closedSpy(&worker, &DatabaseWorker::closed);
+
+    manager.applySetups({setup}); // connectOnStart:装配即连
+    QTRY_VERIFY_WITH_TIMEOUT(telSpy.size() >= 10, 8000); // 100ms 周期
+
+    // 命令闭环:150ms 在模拟器合法域内,Success(SetParameter uint32 参数)
+    manager.sendCommand(QStringLiteral("itest-07"), kCmdSetParameter,
+                        {periodParam(150)});
+    QTRY_VERIFY_WITH_TIMEOUT(finishedSpy.size() >= 1, 3000);
+    const CommandOutcome out = finishedSpy.first().at(1).value<CommandOutcome>();
+    QCOMPARE(out.state, CommandState::Succeeded);
+
+    // 批量双触发 + 事件直写:队列归零且零丢弃
+    QTRY_VERIFY_WITH_TIMEOUT(worker.pendingSamples() == 0 && worker.pendingEvents() == 0,
+                             5000);
+    QCOMPARE(worker.droppedSamples(), quint64(0));
+    QCOMPARE(worker.droppedEvents(), quint64(0));
+
+    // 只读连接读回:Repository 分页 + 原生 SQL 核对列
+    Database reader;
+    QVERIFY2(reader.openExisting(settings.databasePath, 200).ok, "只读打开失败");
+    Repository repo(&reader);
+
+    dms::persistence::TelemetryQuery query;
+    query.deviceId = QStringLiteral("itest-07");
+    dms::persistence::TelemetryCursor cursor;
+    QString err;
+    const auto page = repo.queryPage(query, &cursor, 1000, &err);
+    QVERIFY2(page.has_value(), qPrintable(err));
+    QVERIFY(!page->hasMore);
+    QVERIFY(page->rows.size() >= 40); // ≥10 帧 × 4 指标
+
+    qint64 prevReceivedAt = 0;
+    bool seen[5] = {};
+    for (const dms::persistence::TelemetryRow &r : page->rows) {
+        QVERIFY(r.metricId >= 1 && r.metricId <= 4);
+        seen[r.metricId] = true;
+        QVERIFY(r.ts > 0);
+        QVERIFY(r.receivedAt > 0);
+        QVERIFY(r.receivedAt >= prevReceivedAt); // (received_at,id) 升序
+        prevReceivedAt = r.receivedAt;
+    }
+    QVERIFY(seen[1] && seen[2] && seen[3] && seen[4]);
+
+    QSqlQuery cmdQuery(reader.sql());
+    QVERIFY2(cmdQuery.exec(QStringLiteral(
+                  "SELECT command_type, request_json, result, ack_status, session_id"
+                  " FROM commands WHERE device_id='itest-07'")),
+             qPrintable(cmdQuery.lastError().text()));
+    QVERIFY(cmdQuery.next());
+    QCOMPARE(cmdQuery.value(0).toString(), QStringLiteral("SetParameter"));
+    QVERIFY(cmdQuery.value(1).toString().contains(QStringLiteral("\"value\":150")));
+    QCOMPARE(cmdQuery.value(2).toString(), QStringLiteral("Succeeded"));
+    QCOMPARE(cmdQuery.value(3).toInt(), 0);
+    const QString commandSession = cmdQuery.value(4).toString();
+    QVERIFY(!commandSession.isEmpty());
+    QVERIFY(!cmdQuery.next()); // 全程只受理一条
+
+    // 遥测与命令同一连接会话,session_id 一致入库
+    QSqlQuery telSession(reader.sql());
+    QVERIFY2(telSession.exec(QStringLiteral(
+                  "SELECT DISTINCT session_id FROM telemetry WHERE device_id='itest-07'")),
+             qPrintable(telSession.lastError().text()));
+    QVERIFY(telSession.next());
+    QCOMPARE(telSession.value(0).toString(), commandSession);
+    QVERIFY(!telSession.next());
+
+    // 排空关闭:零未提交零丢弃,不伪报成功
+    worker.drainAndClose();
+    QCOMPARE(closedSpy.count(), 1);
+    QCOMPARE(closedSpy.first().at(0).toLongLong(), qint64(0));
+    QCOMPARE(closedSpy.first().at(1).toLongLong(), qint64(0));
+    QCOMPARE(closedSpy.first().at(2).toULongLong(), quint64(0));
+    QCOMPARE(closedSpy.first().at(3).toULongLong(), quint64(0));
 }
 
 QTEST_MAIN(TestIntegration)
