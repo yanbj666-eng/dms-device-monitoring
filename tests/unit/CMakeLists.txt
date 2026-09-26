@@ -25,6 +25,18 @@ target_compile_features(tst_tcptransport PRIVATE cxx_std_17)
 target_link_libraries(tst_tcptransport PRIVATE dms_transport Qt6::Network Qt6::Test)
 add_test(NAME tst_tcptransport COMMAND tst_tcptransport)
 
+# UDP 传输:回环真 socket 验 bind/来源隔离/端点共享/写路径(协议 §7)
+add_executable(tst_udptransport tst_udptransport.cpp)
+target_compile_features(tst_udptransport PRIVATE cxx_std_17)
+target_link_libraries(tst_udptransport PRIVATE dms_transport Qt6::Network Qt6::Test)
+add_test(NAME tst_udptransport COMMAND tst_udptransport)
+
+# 串口传输:无硬件环境下可复现的错误路径;成功/拔出路径在集成测试补
+add_executable(tst_serialtransport tst_serialtransport.cpp)
+target_compile_features(tst_serialtransport PRIVATE cxx_std_17)
+target_link_libraries(tst_serialtransport PRIVATE dms_transport Qt6::SerialPort Qt6::Test)
+add_test(NAME tst_serialtransport COMMAND tst_serialtransport)
+
 add_executable(tst_devicesession tst_devicesession.cpp)
 target_compile_features(tst_devicesession PRIVATE cxx_std_17)
 target_link_libraries(tst_devicesession PRIVATE dms_domain Qt6::Test)

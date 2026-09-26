@@ -13,7 +13,8 @@ set(CMAKE_AUTOMOC ON)
 # Network:QTcpSocket/QTcpServer(S2 transport 与 simulator)
 # Widgets:S4 最小 UI(GUI 随 Widgets 传递引入)
 # Sql:QSqlDatabase/QSQLITE(S5 持久化)
-find_package(Qt6 6.8 REQUIRED COMPONENTS Core Network Test Widgets Sql)
+# SerialPort:QSerialPort(S7 串口传输与模拟器)
+find_package(Qt6 6.8 REQUIRED COMPONENTS Core Network Test Widgets Sql SerialPort)
 
 enable_testing()
 

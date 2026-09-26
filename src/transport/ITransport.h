@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QByteArray>
+#include <QHostAddress>
 #include <QObject>
 #include <QString>
 
@@ -57,6 +58,11 @@ signals:
     void writeAccepted(quint64 requestId); // 已入队,不等于已送达/已执行
     void errorOccurred(dms::transport::TransportError error);
     void bytesReceived(const QByteArray &bytes);
+    // UDP 专用(LLD §1):保留来源与报文边界。来源过滤在 UdpTransport
+    // 内部完成(未配置来源整报丢弃),因此 sender 一定是配置的 peer。
+    // IO 线程内 direct 连接,不做 queued 跨线程注册
+    void datagramReceived(const QByteArray &bytes, const QHostAddress &sender,
+                          quint16 senderPort);
 };
 
 } // namespace dms::transport
