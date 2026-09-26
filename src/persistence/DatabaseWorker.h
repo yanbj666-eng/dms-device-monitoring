@@ -8,8 +8,10 @@
 
 #include <deque>
 #include <functional>
+#include <variant>
 
 #include "Database.h"
+#include "domain/AlarmEngine.h"
 #include "domain/CommandTracker.h"
 #include "domain/DeviceManager.h"
 #include "domain/DeviceSession.h"
@@ -35,10 +37,13 @@ struct DbWorkerSettings {
 //     队列满丢新样本并累计 droppedSamples(不丢旧、不静默);
 //   - 每批一个 BEGIN IMMEDIATE 事务,任一失败整批回滚保留,按节奏重试;
 //     重复键 ON CONFLICT(唯一键) DO NOTHING,同键异值日志报告不覆盖;
-//   - 命令事件 FIFO:受理(Sent 插入)与终态(更新)保持顺序,
-//     空闲时直写低延迟,失败积压重试,满时丢新并明确报告未持久化;
+//   - 命令/告警事件共用一条 FIFO(容量 event_queue_size):受理(Sent 插入)、
+//     终态(更新)与告警触发/恢复/确认保持到达顺序;空闲时直写低延迟,
+//     失败积压重试,满时丢新并明确报告未持久化;
 //   - received_at/created_at/finished_at 在本层入队时打点(UTC 墙钟):
 //     跨线程 queued 延迟毫秒级,换来单一时钟源与可注入可测性。
+//     告警列例外:atMs 由引擎在裁决点打(测试注入假时钟可断言时间列),
+//     本层照抄,满足 cleared_at ≥ ts 的 CHECK 只依赖 FIFO 顺序。
 // 线程约定:无 parent → moveToThread;started 槽里 initialize;
 // GUI/IO 只经 queued 信号喂数据,结果经 flushCompleted/closed/dbFatal 回报
 class DatabaseWorker : public QObject
@@ -68,6 +73,9 @@ public slots:
     void onTelemetry(QString deviceId, dms::domain::TelemetryBatch batch);
     void onCommandSubmitted(dms::domain::CommandSubmission submission);
     void onCommandFinished(QString deviceId, dms::domain::CommandOutcome outcome);
+    // 告警生命周期事件:Triggered=INSERT, Cleared/Acknowledged=UPDATE;
+    // atMs 用引擎打点(见类注释),本层不重打
+    void onAlarmEvent(dms::domain::AlarmEvent event);
     // 定时器驱动的时间触发;测试注入假时钟后手动调用推进
     void pollFlush();
     // 退出排空(BlockingQueued 调用):预算内重试,完成发 closed 并关连接;
@@ -107,8 +115,13 @@ private:
         quint16 ackStatus = 0;
     };
 
+    // 命令/告警事件:FIFO 保序(单一队列保证同键事件不乱序)。
+    // 命令:submitted=true 是 commands 表 Sent 插入,false 是终态更新;
+    // 告警:AlarmEvent 原样落库(atMs 已是引擎打点)
+    using Event = std::variant<CommandEvent, dms::domain::AlarmEvent>;
+
     bool flushTelemetryChunk(); // 一批一事务(batch_samples 上限,LLD §7)
-    bool flushCommandEvents();  // 事件 FIFO 一事务清空
+    bool flushEvents();         // 事件 FIFO 一事务清空(命令+告警)
     // 两者都试,刷新时间锚点并发 flushCompleted;返回本轮是否全部成功
     bool flushOnce();
     void reportDuplicate(const PendingSample &sample); // 同键异值诊断
@@ -123,7 +136,7 @@ private:
     Database database_;
     QTimer *flushTimer_ = nullptr; // initialize 时在本线程创建(线程亲和)
     std::deque<PendingSample> pending_;
-    std::deque<CommandEvent> events_;
+    std::deque<Event> events_;
     QSet<QString> knownDevices_; // 已 upsert 设备:防 FK 毒丸堵死队列
     qint64 lastFlushAtMs_ = 0;
     bool stopped_ = false; // drainAndClose 之后

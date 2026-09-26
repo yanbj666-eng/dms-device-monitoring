@@ -1,7 +1,7 @@
 // tst_databaseworker:LLD §7 DB 队列与退出测试
 // 覆盖(TC-DB-002/003/004):批量双触发(数量/时间)、失败整批回滚保留重试、
 // 重试不改写入队时打点的 received_at、队列满丢新计数、同键 DO NOTHING 保留原值、
-// 命令事件 FIFO 生命周期与直写、事件队列满丢弃、未入库设备/未知命令防毒丸、
+// 命令/告警事件 FIFO 生命周期与直写、事件队列满丢弃、未入库设备/未知命令防毒丸、
 // 退出排空与超时未提交数上报、致命初始化后的显式丢弃
 #include <QtTest>
 
@@ -133,6 +133,25 @@ CommandOutcome makeOutcome(const QUuid &sessionId, quint32 seq,
     return outcome;
 }
 
+// 引擎裁决点的告警事件形态:atMs 由引擎打点,worker 照抄(不做二次打点)
+dms::domain::AlarmEvent makeAlarm(dms::domain::AlarmEvent::Kind kind, qint64 atMs,
+                                  quint16 metricId = 1, int level = 3,
+                                  const QString &code = QString::fromLatin1(
+                                      dms::domain::AlarmCode::ThresholdHigh))
+{
+    dms::domain::AlarmEvent event;
+    event.kind = kind;
+    event.deviceId = QStringLiteral("dev1");
+    event.metricId = metricId;
+    event.level = quint8(level);
+    event.code = code;
+    event.message = QStringLiteral("温度 85.0 越上界 80.0");
+    event.clearReason = kind == dms::domain::AlarmEvent::Kind::Cleared
+                            ? QStringLiteral("recovered") : QString();
+    event.atMs = atMs;
+    return event;
+}
+
 } // namespace
 
 class TestDatabaseWorker : public QObject
@@ -154,6 +173,9 @@ private slots:
     void fatalInitDropsEverything();
     void unknownDeviceTelemetryDropped();
     void unknownCommandIdDropped();
+    void alarmLifecycleRecorded();
+    void alarmUnknownDeviceDropped();
+    void alarmTriggeredOutsideConstraintsDropped();
 
 private:
     // 每用例独立:假时钟 + 小参数 worker + 临时库。
@@ -474,6 +496,102 @@ void TestDatabaseWorker::unknownCommandIdDropped()
     QCOMPARE(h.worker->pendingEvents(), 0);
     FixtureDb fx(h.path);
     QCOMPARE(fx.scalar(QStringLiteral("SELECT COUNT(*) FROM commands")).toInt(), 0);
+}
+
+// S6(TC-ALARM-004 落库面):触发 INSERT → 确认 UPDATE → 恢复 UPDATE → 再触发
+// 新行;atMs 全程照抄引擎打点不重打,时间列可直接断言(假时钟同源)
+void TestDatabaseWorker::alarmLifecycleRecorded()
+{
+    Harness h = makeHarness();
+    using Kind = dms::domain::AlarmEvent::Kind;
+
+    // 触发:空闲直写插入一行活跃告警
+    h.worker->onAlarmEvent(makeAlarm(Kind::Triggered, 1000));
+    QCOMPARE(h.worker->pendingEvents(), 0);
+
+    FixtureDb fx(h.path);
+    QSqlQuery q(QSqlDatabase::database(fx.name()));
+    QVERIFY(q.exec(QStringLiteral(
+        "SELECT device_id, metric_id, level, code, message, ts, acknowledged,"
+        " acknowledged_at, cleared_at FROM alarms")));
+    QVERIFY(q.next());
+    QCOMPARE(q.value(0).toString(), QStringLiteral("dev1"));
+    QCOMPARE(q.value(1).toInt(), 1);
+    QCOMPARE(q.value(2).toInt(), 3);
+    QCOMPARE(q.value(3).toString(), QStringLiteral("THRESHOLD_HIGH"));
+    QVERIFY(q.value(4).toString().contains(QStringLiteral("85.0")));
+    QCOMPARE(q.value(5).toLongLong(), qint64(1000)); // 引擎打点原样入库
+    QCOMPARE(q.value(6).toInt(), 0);
+    QVERIFY(q.value(7).isNull());
+    QVERIFY(q.value(8).isNull());
+    QVERIFY(!q.next());
+
+    // 确认(先于恢复):acknowledged 置位并带 acknowledged_at ≥ ts
+    h.worker->onAlarmEvent(makeAlarm(Kind::Acknowledged, 1500));
+    QCOMPARE(fx.scalar(QStringLiteral(
+                  "SELECT acknowledged FROM alarms")).toInt(), 1);
+    QCOMPARE(fx.scalar(QStringLiteral(
+                  "SELECT acknowledged_at FROM alarms")).toLongLong(), qint64(1500));
+
+    // 恢复:补 cleared_at 与 clear_reason
+    h.worker->onAlarmEvent(makeAlarm(Kind::Cleared, 2000));
+    QCOMPARE(fx.scalar(QStringLiteral(
+                  "SELECT cleared_at FROM alarms")).toLongLong(), qint64(2000));
+    QCOMPARE(fx.scalar(QStringLiteral(
+                  "SELECT clear_reason FROM alarms")).toString(),
+             QStringLiteral("recovered"));
+
+    // 同键再越界:全新第二行,旧行历史保留(活跃不重复)
+    h.worker->onAlarmEvent(makeAlarm(Kind::Triggered, 3000));
+    QCOMPARE(fx.scalar(QStringLiteral("SELECT COUNT(*) FROM alarms")).toInt(), 2);
+    QCOMPARE(fx.scalar(QStringLiteral(
+                  "SELECT COUNT(*) FROM alarms WHERE cleared_at IS NULL")).toInt(), 1);
+
+    // 设备级告警(metricId=0)合法:COMM_LOST 不占指标位
+    h.worker->onAlarmEvent(makeAlarm(Kind::Triggered, 3100, /*metricId=*/0,
+                                     /*level=*/3,
+                                     QString::fromLatin1(dms::domain::AlarmCode::CommLost)));
+    QCOMPARE(fx.scalar(QStringLiteral(
+                  "SELECT metric_id FROM alarms WHERE code='COMM_LOST'")).toInt(), 0);
+    QCOMPARE(h.worker->droppedEvents(), quint64(0));
+}
+
+void TestDatabaseWorker::alarmUnknownDeviceDropped()
+{
+    Harness h = makeHarness();
+    // 防 FK 毒丸:未入库设备的告警丢弃计数,不进队堵死重试
+    dms::domain::AlarmEvent event = makeAlarm(dms::domain::AlarmEvent::Kind::Triggered,
+                                              1000);
+    event.deviceId = QStringLiteral("ghost");
+    h.worker->onAlarmEvent(event);
+    QCOMPARE(h.worker->droppedEvents(), quint64(1));
+    QCOMPARE(h.worker->pendingEvents(), 0);
+    FixtureDb fx(h.path);
+    QCOMPARE(fx.scalar(QStringLiteral("SELECT COUNT(*) FROM alarms")).toInt(), 0);
+}
+
+void TestDatabaseWorker::alarmTriggeredOutsideConstraintsDropped()
+{
+    Harness h = makeHarness();
+    using Kind = dms::domain::AlarmEvent::Kind;
+    // 触发事件入库前过表 CHECK 域:等级/指标域外与空消息在这里丢,
+    // 不进队列毒化整批重试
+    h.worker->onAlarmEvent(makeAlarm(Kind::Triggered, 1000, 1, /*level=*/0));
+    dms::domain::AlarmEvent badMetric = makeAlarm(Kind::Triggered, 1000, /*metricId=*/9);
+    h.worker->onAlarmEvent(badMetric);
+    dms::domain::AlarmEvent noMessage = makeAlarm(Kind::Triggered, 1000);
+    noMessage.message.clear();
+    h.worker->onAlarmEvent(noMessage);
+    QCOMPARE(h.worker->droppedEvents(), quint64(3));
+    QCOMPARE(h.worker->pendingEvents(), 0);
+
+    FixtureDb fx(h.path);
+    QCOMPARE(fx.scalar(QStringLiteral("SELECT COUNT(*) FROM alarms")).toInt(), 0);
+
+    // 域内事件不受影响,正常入库
+    h.worker->onAlarmEvent(makeAlarm(Kind::Triggered, 1000, 1, /*level=*/1));
+    QCOMPARE(fx.scalar(QStringLiteral("SELECT COUNT(*) FROM alarms")).toInt(), 1);
+    QCOMPARE(fx.scalar(QStringLiteral("SELECT level FROM alarms")).toInt(), 1);
 }
 
 QTEST_MAIN(TestDatabaseWorker)

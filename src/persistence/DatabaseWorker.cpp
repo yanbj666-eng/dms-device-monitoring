@@ -222,7 +222,7 @@ void DatabaseWorker::onCommandSubmitted(dms::domain::CommandSubmission submissio
     event.atMs = clock_();
     event.commandId = submission.commandId;
     event.params = submission.params;
-    events_.push_back(std::move(event));
+    events_.push_back(Event{std::move(event)});
     tryFlushEventsIfIdle();
 }
 
@@ -256,7 +256,49 @@ void DatabaseWorker::onCommandFinished(QString deviceId,
     event.atMs = clock_();
     event.finalState = outcome.state;
     event.ackStatus = outcome.ackStatus;
-    events_.push_back(std::move(event));
+    events_.push_back(Event{std::move(event)});
+    tryFlushEventsIfIdle();
+}
+
+void DatabaseWorker::onAlarmEvent(dms::domain::AlarmEvent event)
+{
+    if (stopped_ || fatal_) {
+        ++droppedEvents_;
+        return;
+    }
+    if (!knownDevices_.contains(event.deviceId)) {
+        // 防 FK 毒丸:与遥测/命令同口径,未知设备不进队列
+        ++droppedEvents_;
+        dms::logMessage(dms::LogLevel::Warn, dms::LogCategory::Db,
+                        {event.deviceId, {}},
+                        QStringLiteral("告警事件无法持久化(设备未入库):%1 [%2]")
+                            .arg(event.code)
+                            .arg(event.metricId));
+        return;
+    }
+    // 触发事件入库前先过表 CHECK 约束:等级/指标域外的畸形事件在这里丢,
+    // 不能进队列毒化重试(整批回滚会永久堵死事件通道)
+    if (event.kind == dms::domain::AlarmEvent::Kind::Triggered
+        && (event.level < 1 || event.level > 3 || event.metricId > 4
+            || event.message.isEmpty())) {
+        ++droppedEvents_;
+        dms::logMessage(dms::LogLevel::Warn, dms::LogCategory::Db,
+                        {event.deviceId, {}, dms::ErrorCode::DbWriteFailed},
+                        QStringLiteral("告警触发事件违反表约束,丢弃:level=%1 metric=%2")
+                            .arg(event.level)
+                            .arg(event.metricId));
+        return;
+    }
+    if (int(events_.size()) >= settings_.eventQueueSize) {
+        ++droppedEvents_;
+        dms::logMessage(dms::LogLevel::Error, dms::LogCategory::Db,
+                        {event.deviceId, {}, dms::ErrorCode::DbQueueFull},
+                        QStringLiteral("告警事件未持久化(事件队列满):%1 [%2]")
+                            .arg(event.code)
+                            .arg(event.metricId));
+        return;
+    }
+    events_.push_back(Event{std::move(event)});
     tryFlushEventsIfIdle();
 }
 
@@ -276,7 +318,7 @@ void DatabaseWorker::pollFlush()
 bool DatabaseWorker::flushOnce()
 {
     const bool telemetryOk = flushTelemetryChunk();
-    const bool eventsOk = flushCommandEvents();
+    const bool eventsOk = flushEvents();
     lastFlushAtMs_ = clock_();
     emit flushCompleted(telemetryOk && eventsOk, int(pending_.size()),
                         int(events_.size()));
@@ -366,7 +408,7 @@ void DatabaseWorker::reportDuplicate(const PendingSample &sample)
     }
 }
 
-bool DatabaseWorker::flushCommandEvents()
+bool DatabaseWorker::flushEvents()
 {
     if (events_.empty())
         return true;
@@ -377,7 +419,7 @@ bool DatabaseWorker::flushCommandEvents()
     if (!database_.beginImmediate(&error)) {
         dms::logMessage(dms::LogLevel::Error, dms::LogCategory::Db,
                         {QString(), {}, dms::ErrorCode::DbWriteFailed},
-                        QStringLiteral("命令事件开事务失败,整批保留重试:%1").arg(error));
+                        QStringLiteral("事件开事务失败,整批保留重试:%1").arg(error));
         return false;
     }
 
@@ -392,44 +434,106 @@ bool DatabaseWorker::flushCommandEvents()
         "UPDATE commands SET result=:result, ack_status=:ack,"
         " finished_at=MAX(:finished, created_at)"
         " WHERE device_id=:dev AND session_id=:session AND seq=:seq"));
+    QSqlQuery alarmInsert(database_.sql());
+    alarmInsert.prepare(QStringLiteral(
+        "INSERT INTO alarms(device_id,metric_id,level,code,message,ts,acknowledged)"
+        " VALUES(?,?,?,?,?,?,0)"));
+    QSqlQuery alarmClear(database_.sql());
+    alarmClear.prepare(QStringLiteral(
+        "UPDATE alarms SET cleared_at=:cleared, clear_reason=:reason"
+        " WHERE device_id=:dev AND code=:code AND metric_id=:metric"
+        " AND cleared_at IS NULL"));
+    QSqlQuery alarmAck(database_.sql());
+    alarmAck.prepare(QStringLiteral(
+        "UPDATE alarms SET acknowledged=1, acknowledged_at=:at"
+        " WHERE acknowledged=0 AND id=("
+        "SELECT id FROM alarms WHERE device_id=:dev AND code=:code"
+        " AND metric_id=:metric ORDER BY id DESC LIMIT 1)"));
 
-    for (const CommandEvent &event : events_) {
+    for (const Event &event : events_) {
         bool ok = false;
-        if (event.submitted) {
-            insert.bindValue(0, event.deviceId);
-            insert.bindValue(1, sessionKey(event.sessionId));
-            insert.bindValue(2, event.seq);
-            insert.bindValue(3, commandTypeName(event.commandId));
-            insert.bindValue(4, commandRequestJson(event.params));
-            insert.bindValue(5, event.atMs);
-            ok = insert.exec();
-        } else {
-            update.bindValue(QStringLiteral(":result"), terminalResult(event.finalState));
-            update.bindValue(QStringLiteral(":ack"),
-                             isAckTerminal(event.finalState)
-                                 ? QVariant::fromValue(event.ackStatus)
-                                 : QVariant());
-            update.bindValue(QStringLiteral(":finished"), event.atMs);
-            update.bindValue(QStringLiteral(":dev"), event.deviceId);
-            update.bindValue(QStringLiteral(":session"), sessionKey(event.sessionId));
-            update.bindValue(QStringLiteral(":seq"), event.seq);
-            ok = update.exec();
-            if (ok && update.numRowsAffected() == 0) {
-                // 受理行被丢过(队列满)或库重开过:诚实报告,不算失败
-                dms::logMessage(dms::LogLevel::Warn, dms::LogCategory::Db,
-                                {event.deviceId, event.sessionId},
-                                QStringLiteral("命令终态更新未命中:seq=%1")
-                                    .arg(event.seq));
+        QString detail;
+        if (const CommandEvent *cmd = std::get_if<CommandEvent>(&event)) {
+            if (cmd->submitted) {
+                insert.bindValue(0, cmd->deviceId);
+                insert.bindValue(1, sessionKey(cmd->sessionId));
+                insert.bindValue(2, cmd->seq);
+                insert.bindValue(3, commandTypeName(cmd->commandId));
+                insert.bindValue(4, commandRequestJson(cmd->params));
+                insert.bindValue(5, cmd->atMs);
+                ok = insert.exec();
+            } else {
+                update.bindValue(QStringLiteral(":result"), terminalResult(cmd->finalState));
+                update.bindValue(QStringLiteral(":ack"),
+                                 isAckTerminal(cmd->finalState)
+                                     ? QVariant::fromValue(cmd->ackStatus)
+                                     : QVariant());
+                update.bindValue(QStringLiteral(":finished"), cmd->atMs);
+                update.bindValue(QStringLiteral(":dev"), cmd->deviceId);
+                update.bindValue(QStringLiteral(":session"), sessionKey(cmd->sessionId));
+                update.bindValue(QStringLiteral(":seq"), cmd->seq);
+                ok = update.exec();
+                if (ok && update.numRowsAffected() == 0) {
+                    // 受理行被丢过(队列满)或库重开过:诚实报告,不算失败
+                    dms::logMessage(dms::LogLevel::Warn, dms::LogCategory::Db,
+                                    {cmd->deviceId, cmd->sessionId},
+                                    QStringLiteral("命令终态更新未命中:seq=%1")
+                                        .arg(cmd->seq));
+                }
+            }
+            detail = cmd->submitted ? insert.lastError().text() : update.lastError().text();
+        } else if (const dms::domain::AlarmEvent *alarm =
+                       std::get_if<dms::domain::AlarmEvent>(&event)) {
+            switch (alarm->kind) {
+            case dms::domain::AlarmEvent::Kind::Triggered:
+                alarmInsert.bindValue(0, alarm->deviceId);
+                alarmInsert.bindValue(1, alarm->metricId);
+                alarmInsert.bindValue(2, alarm->level);
+                alarmInsert.bindValue(3, alarm->code);
+                alarmInsert.bindValue(4, alarm->message);
+                alarmInsert.bindValue(5, alarm->atMs);
+                ok = alarmInsert.exec();
+                break;
+            case dms::domain::AlarmEvent::Kind::Cleared:
+                alarmClear.bindValue(QStringLiteral(":cleared"), alarm->atMs);
+                alarmClear.bindValue(QStringLiteral(":reason"), alarm->clearReason);
+                alarmClear.bindValue(QStringLiteral(":dev"), alarm->deviceId);
+                alarmClear.bindValue(QStringLiteral(":code"), alarm->code);
+                alarmClear.bindValue(QStringLiteral(":metric"), alarm->metricId);
+                ok = alarmClear.exec();
+                detail = alarmClear.lastError().text();
+                if (ok && alarmClear.numRowsAffected() == 0) {
+                    // 触发行被丢过(队列满/重启恢复已关闭):如实报告
+                    dms::logMessage(dms::LogLevel::Warn, dms::LogCategory::Db,
+                                    {alarm->deviceId, {}},
+                                    QStringLiteral("告警恢复更新未命中:%1 [%2]")
+                                        .arg(alarm->code)
+                                        .arg(alarm->metricId));
+                }
+                break;
+            case dms::domain::AlarmEvent::Kind::Acknowledged:
+                // 确认落"该键最近一条未确认":与引擎内存裁决同语义
+                // (引擎侧确认最近记录,DB 侧 ORDER BY id DESC LIMIT 1)
+                alarmAck.bindValue(QStringLiteral(":at"), alarm->atMs);
+                alarmAck.bindValue(QStringLiteral(":dev"), alarm->deviceId);
+                alarmAck.bindValue(QStringLiteral(":code"), alarm->code);
+                alarmAck.bindValue(QStringLiteral(":metric"), alarm->metricId);
+                ok = alarmAck.exec();
+                detail = alarmAck.lastError().text();
+                if (ok && alarmAck.numRowsAffected() == 0)
+                    dms::logMessage(dms::LogLevel::Warn, dms::LogCategory::Db,
+                                    {alarm->deviceId, {}},
+                                    QStringLiteral("告警确认更新未命中:%1 [%2]")
+                                        .arg(alarm->code)
+                                        .arg(alarm->metricId));
+                break;
             }
         }
         if (!ok) {
-            const QString detail = event.submitted ? insert.lastError().text()
-                                                   : update.lastError().text();
             database_.rollback();
             dms::logMessage(dms::LogLevel::Error, dms::LogCategory::Db,
-                            {event.deviceId, event.sessionId,
-                             dms::ErrorCode::DbWriteFailed},
-                            QStringLiteral("命令事件写入失败已回滚,整批保留重试:%1")
+                            {QString(), {}, dms::ErrorCode::DbWriteFailed},
+                            QStringLiteral("事件写入失败已回滚,整批保留重试:%1")
                                 .arg(detail));
             return false;
         }
@@ -438,7 +542,7 @@ bool DatabaseWorker::flushCommandEvents()
         database_.rollback();
         dms::logMessage(dms::LogLevel::Error, dms::LogCategory::Db,
                         {QString(), {}, dms::ErrorCode::DbWriteFailed},
-                        QStringLiteral("命令事件提交失败已回滚:%1").arg(error));
+                        QStringLiteral("事件提交失败已回滚:%1").arg(error));
         return false;
     }
     events_.clear();
@@ -450,7 +554,7 @@ void DatabaseWorker::tryFlushEventsIfIdle()
     // 直写低延迟路径:仅当 FIFO 里只有刚到的这一条(此前无积压)。
     // 积压非空说明上一轮失败等重试,只追加保持顺序
     if (int(events_.size()) == 1 && !stopped_ && !fatal_ && database_.isOpen())
-        flushCommandEvents();
+        flushEvents();
 }
 
 void DatabaseWorker::dropSample(const QString &deviceId, int count,
