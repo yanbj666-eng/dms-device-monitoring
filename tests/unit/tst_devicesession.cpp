@@ -756,6 +756,8 @@ void TestDeviceSession::commandRoundTripSucceeded()
     QCOMPARE(out.commandId, quint16(4));
     QCOMPARE(out.state, CommandState::Succeeded);
     QCOMPARE(out.ackStatus, quint16(AckStatus::Success));
+    // 回归:ACK 终态也必须带会话 ID(S5 终态 UPDATE 按它定位行,曾因绕过 finishPending 漏打标)
+    QCOMPARE(out.sessionId, rig.session->sessionId());
 }
 
 // ACK 非 Success → Rejected(设备拒绝,不是本地失败)
@@ -772,6 +774,7 @@ void TestDeviceSession::commandRejectedStatus()
     QVERIFY(findOutcome(finSpy, seq, out));
     QCOMPARE(out.state, CommandState::Rejected);
     QCOMPARE(out.ackStatus, quint16(AckStatus::BadParams));
+    QCOMPARE(out.sessionId, rig.session->sessionId()); // 同上:ACK 终态带会话 ID
 }
 
 // 2000ms 无 ACK → TimedOut;迟到 ACK 只记日志不改结果(LLD §4)

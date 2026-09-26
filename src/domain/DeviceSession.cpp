@@ -338,7 +338,8 @@ void DeviceSession::handleCommandAck(const DecodedFrame &frame)
     noteValidReceive();
     emit commandAckReceived(frame.seq, commandId, quint16(status));
     if (auto outcome = commands_.onAck(frame.seq, commandId, quint16(status)))
-        emit commandFinished(*outcome);
+        // 与超时/取消/失败路径一致,经 finishPending 补 sessionId 再发射(S5 落库依赖)
+        finishPending(outcome);
     else
         // 迟到/重复/无关 ACK:只记日志,不修改已结束结果(LLD §4)
         dms::logMessage(dms::LogLevel::Debug, dms::LogCategory::Protocol, logCtx(),
