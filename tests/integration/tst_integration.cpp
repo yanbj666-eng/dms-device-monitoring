@@ -22,6 +22,7 @@
 
 #include "Frame.h"
 #include "MessageCodec.h"
+#include "domain/AlarmEngine.h"
 #include "domain/DeviceManager.h"
 #include "domain/DeviceSession.h"
 #include "persistence/Database.h"
@@ -180,6 +181,48 @@ bool findFinished(const QSignalSpy &spy, quint32 seq, CommandOutcome &out)
     return false;
 }
 
+// ---- S6 告警 E2E 辅助(与 main.cpp 同拓扑;线程跳变在装配与单元层覆盖)----
+
+// manager → engine 四路直连:同线程 auto 解析为 direct
+void connectAlarmPipeline(DeviceManager *manager, dms::domain::AlarmEngine *engine)
+{
+    QObject::connect(manager, &DeviceManager::deviceTelemetry, engine,
+                     &dms::domain::AlarmEngine::onTelemetry);
+    QObject::connect(manager, &DeviceManager::deviceStateChanged, engine,
+                     &dms::domain::AlarmEngine::onSessionState);
+    QObject::connect(manager, &DeviceManager::deviceProtocolHealth, engine,
+                     &dms::domain::AlarmEngine::onProtocolHealth);
+    QObject::connect(manager, &DeviceManager::deviceCommandFinished, engine,
+                     &dms::domain::AlarmEngine::onCommandFinished);
+}
+
+// 统计 kind+code+device(可选 metricId)匹配的事件数;0xFFFF = 不限指标
+int countAlarms(const QSignalSpy &spy, dms::domain::AlarmEvent::Kind kind,
+                const QString &code, const QString &deviceId,
+                quint16 metricId = 0xFFFF)
+{
+    int count = 0;
+    for (const QList<QVariant> &args : spy) {
+        const dms::domain::AlarmEvent event =
+            args.at(0).value<dms::domain::AlarmEvent>();
+        if (event.kind == kind && event.code == code && event.deviceId == deviceId
+            && (metricId == 0xFFFF || event.metricId == metricId))
+            ++count;
+    }
+    return count;
+}
+
+// 在 manager 级 commandFinished spy(参数 1 是 outcome)里找 Succeeded 终态
+bool findManagerFinished(const QSignalSpy &spy, quint16 commandId)
+{
+    for (const QList<QVariant> &args : spy) {
+        const CommandOutcome out = args.at(1).value<CommandOutcome>();
+        if (out.commandId == commandId && out.state == CommandState::Succeeded)
+            return true;
+    }
+    return false;
+}
+
 } // namespace
 
 // 事件循环保持运转地等到锚点时刻(QTRY 每步处理事件,socket/timer 不挨饿)
@@ -206,6 +249,10 @@ private slots:
     void faultFragmentAndMergeWindows();
     void faultOfflineRecovery();
     void persistenceRoundTrip();
+    void alarmThresholdsEndToEnd();
+    void alarmCrcEndToEnd();
+    void alarmStaleAndCommLostEndToEnd();
+    void acquisitionPauseExemptsStaleAlarm();
 
 private:
     SimProcess sim_; // 每用例一个全新模拟器进程,状态隔离
@@ -738,6 +785,259 @@ void TestIntegration::persistenceRoundTrip()
     QCOMPARE(closedSpy.first().at(1).toLongLong(), qint64(0));
     QCOMPARE(closedSpy.first().at(2).toULongLong(), quint64(0));
     QCOMPARE(closedSpy.first().at(3).toULongLong(), quint64(0));
+}
+
+// S6 E2E 之一(TC-ALARM-001/002):越界值窗口 → 阈值触发/恢复 → 落库。
+// 越界帧 温度 999 / 压力 -5 / 电压 300 / 转速 4e9;规则只配 1/2,
+// 3/4 同窗异常不产生阈值告警(未配置的指标不评估,LLD §6)
+void TestIntegration::alarmThresholdsEndToEnd()
+{
+    QVERIFY(sim_.start(1, 100,
+                       {QStringLiteral("-f"), QStringLiteral("abnormalValue@600+1000")}));
+
+    const QString id = QStringLiteral("itest-11");
+    dms::domain::DeviceSetup setup;
+    setup.deviceId = id;
+    setup.transport.deviceId = id;
+    setup.transport.host = QStringLiteral("127.0.0.1");
+    setup.transport.port = sim_.portAt(0);
+
+    // 默认参数即 app.ini [connection] 默认值:poll 100/stale 3000/坏 CRC 5/好 3
+    dms::domain::AlarmEngine engine{dms::domain::AlarmEngine::Settings{}};
+    engine.setRules(id, {{1, -60.0, 80.0, 0.0}, {2, 10.0, 250.0, 0.0}});
+    DeviceManager manager;
+    connectAlarmPipeline(&manager, &engine);
+    QSignalSpy alarmSpy(&engine, &dms::domain::AlarmEngine::alarmEvent);
+
+    // 落库链路同款:引擎出口直连 worker(FIFO 语义,worker 单测已覆盖队列面)
+    QTemporaryDir dir;
+    dms::persistence::DbWorkerSettings ws;
+    ws.databasePath = dir.filePath(QStringLiteral("alarms.db"));
+    ws.busyTimeoutMs = 200;
+    DatabaseWorker worker(ws);
+    DeviceRow row;
+    row.id = id;
+    row.name = QStringLiteral("阈值设备");
+    row.transportType = QStringLiteral("tcp");
+    // config_json NOT NULL:空 QString 绑定成 NULL 会让 upsert 整体回滚(实测踩坑)
+    row.configJson = QStringLiteral("{\"id\":\"itest-11\"}");
+    worker.initialize({row});
+    QObject::connect(&engine, &dms::domain::AlarmEngine::alarmEvent, &worker,
+                     &DatabaseWorker::onAlarmEvent);
+    QSignalSpy closedSpy(&worker, &DatabaseWorker::closed);
+
+    engine.start();
+    manager.applySetups({setup});
+
+    // 窗口内:温度越上界、压力越下界,各触发一次(持续越界去重)
+    QTRY_VERIFY_WITH_TIMEOUT(
+        countAlarms(alarmSpy, dms::domain::AlarmEvent::Kind::Triggered,
+                    QStringLiteral("THRESHOLD_HIGH"), id, 1)
+            == 1,
+        8000);
+    QTRY_VERIFY_WITH_TIMEOUT(
+        countAlarms(alarmSpy, dms::domain::AlarmEvent::Kind::Triggered,
+                    QStringLiteral("THRESHOLD_LOW"), id, 2)
+            == 1,
+        8000);
+
+    // 窗口结束:值回带内,恢复事件 reason=recovered
+    QTRY_VERIFY_WITH_TIMEOUT(
+        countAlarms(alarmSpy, dms::domain::AlarmEvent::Kind::Cleared,
+                    QStringLiteral("THRESHOLD_HIGH"), id, 1)
+            == 1,
+        8000);
+    QTRY_VERIFY_WITH_TIMEOUT(
+        countAlarms(alarmSpy, dms::domain::AlarmEvent::Kind::Cleared,
+                    QStringLiteral("THRESHOLD_LOW"), id, 2)
+            == 1,
+        8000);
+    bool sawRecovered = false;
+    int metric34Triggers = 0;
+    for (const QList<QVariant> &args : alarmSpy) {
+        const dms::domain::AlarmEvent event =
+            args.at(0).value<dms::domain::AlarmEvent>();
+        if (event.kind == dms::domain::AlarmEvent::Kind::Cleared
+            && event.clearReason == QStringLiteral("recovered"))
+            sawRecovered = true;
+        if (event.kind == dms::domain::AlarmEvent::Kind::Triggered
+            && event.metricId >= 3)
+            ++metric34Triggers; // 电压/转速同窗异常但无规则:零告警
+    }
+    QVERIFY(sawRecovered);
+    QCOMPARE(metric34Triggers, 0);
+
+    // 事件队列排空零丢弃,读回 alarms:两行都已恢复,等级与恢复原因落库
+    QTRY_VERIFY_WITH_TIMEOUT(worker.pendingEvents() == 0, 5000);
+    QCOMPARE(worker.droppedEvents(), quint64(0));
+    Database reader;
+    QVERIFY2(reader.openExisting(ws.databasePath, 200).ok, "只读打开失败");
+    QSqlQuery q(reader.sql());
+    QVERIFY2(q.exec(QStringLiteral(
+                  "SELECT code, metric_id, level, acknowledged, cleared_at,"
+                  " clear_reason FROM alarms WHERE device_id='%1' ORDER BY id")
+                  .arg(id)),
+             qPrintable(q.lastError().text()));
+    QVERIFY(q.next());
+    QCOMPARE(q.value(0).toString(), QStringLiteral("THRESHOLD_HIGH"));
+    QCOMPARE(q.value(1).toInt(), 1);
+    QCOMPARE(q.value(2).toInt(), 3); // 阈值 = Error
+    QCOMPARE(q.value(3).toInt(), 0); // 未确认
+    QVERIFY(!q.value(4).isNull());
+    QCOMPARE(q.value(5).toString(), QStringLiteral("recovered"));
+    QVERIFY(q.next());
+    QCOMPARE(q.value(0).toString(), QStringLiteral("THRESHOLD_LOW"));
+    QCOMPARE(q.value(1).toInt(), 2);
+    QVERIFY(!q.value(4).isNull());
+    QVERIFY(!q.next()); // 恰好两行,去重面 E2E 复核
+
+    worker.drainAndClose();
+    QCOMPARE(closedSpy.count(), 1);
+    QCOMPARE(closedSpy.first().at(1).toLongLong(), qint64(0)); // 未提交事件
+}
+
+// S6 E2E 之二(TC-ALARM-003 前半):坏 CRC 窗口 ~10 坏帧 → 第 5 帧触发,
+// 窗口结束 3 有效帧解除;持续坏帧期间只触发一次
+void TestIntegration::alarmCrcEndToEnd()
+{
+    QVERIFY(sim_.start(1, 100,
+                       {QStringLiteral("-f"), QStringLiteral("badCrc@600+1000")}));
+
+    const QString id = QStringLiteral("itest-13");
+    dms::domain::DeviceSetup setup;
+    setup.deviceId = id;
+    setup.transport.deviceId = id;
+    setup.transport.host = QStringLiteral("127.0.0.1");
+    setup.transport.port = sim_.portAt(0);
+
+    DeviceManager manager;
+    dms::domain::AlarmEngine engine{dms::domain::AlarmEngine::Settings{}};
+    connectAlarmPipeline(&manager, &engine);
+    QSignalSpy alarmSpy(&engine, &dms::domain::AlarmEngine::alarmEvent);
+
+    engine.start();
+    manager.applySetups({setup});
+
+    QTRY_VERIFY_WITH_TIMEOUT(
+        countAlarms(alarmSpy, dms::domain::AlarmEvent::Kind::Triggered,
+                    QStringLiteral("PROTOCOL_CRC"), id)
+            == 1,
+        8000);
+    QTRY_VERIFY_WITH_TIMEOUT(
+        countAlarms(alarmSpy, dms::domain::AlarmEvent::Kind::Cleared,
+                    QStringLiteral("PROTOCOL_CRC"), id)
+            == 1,
+        8000);
+    // 触发后窗口仍在(坏帧继续):去重保住只此一次;恢复后不再重触发
+    QCOMPARE(countAlarms(alarmSpy, dms::domain::AlarmEvent::Kind::Triggered,
+                         QStringLiteral("PROTOCOL_CRC"), id),
+             1);
+}
+
+// S6 E2E 之三(TC-ALARM-003/004):停发长窗 → 四指标 DATA_STALE + COMM_LOST,
+// 重连恢复后全部解除。停发 600-6600ms:陈旧 ~3.6s、失联 ~4.6s(设备时刻)
+void TestIntegration::alarmStaleAndCommLostEndToEnd()
+{
+    QVERIFY(sim_.start(1, 100,
+                       {QStringLiteral("-f"), QStringLiteral("stopSending@600+6000")}));
+
+    const QString id = QStringLiteral("itest-14");
+    dms::domain::DeviceSetup setup;
+    setup.deviceId = id;
+    setup.transport.deviceId = id;
+    setup.transport.host = QStringLiteral("127.0.0.1");
+    setup.transport.port = sim_.portAt(0);
+
+    DeviceManager manager;
+    dms::domain::AlarmEngine engine{dms::domain::AlarmEngine::Settings{}};
+    // 无阈值规则:只评估陈旧/CRC/失联
+    connectAlarmPipeline(&manager, &engine);
+    QSignalSpy alarmSpy(&engine, &dms::domain::AlarmEngine::alarmEvent);
+
+    engine.start();
+    manager.applySetups({setup});
+
+    // 窗口内:每个指标一条 DATA_STALE(3000ms 无有效值)
+    for (quint16 m = 1; m <= 4; ++m) {
+        QTRY_VERIFY_WITH_TIMEOUT(
+            countAlarms(alarmSpy, dms::domain::AlarmEvent::Kind::Triggered,
+                        QStringLiteral("DATA_STALE"), id, m)
+                == 1,
+            12000);
+    }
+    // 失联:Reconnecting → COMM_LOST 一次(重试轮次的 Connecting 只重置陈旧
+    // 计时,不解除失联告警)
+    QTRY_VERIFY_WITH_TIMEOUT(
+        countAlarms(alarmSpy, dms::domain::AlarmEvent::Kind::Triggered,
+                    QStringLiteral("COMM_LOST"), id)
+            == 1,
+        15000);
+
+    // 窗口结束重连成功:Online + 新遥测 → 陈旧与失联全部解除
+    for (quint16 m = 1; m <= 4; ++m) {
+        QTRY_VERIFY_WITH_TIMEOUT(
+            countAlarms(alarmSpy, dms::domain::AlarmEvent::Kind::Cleared,
+                        QStringLiteral("DATA_STALE"), id, m)
+                == 1,
+            25000);
+    }
+    QTRY_VERIFY_WITH_TIMEOUT(
+        countAlarms(alarmSpy, dms::domain::AlarmEvent::Kind::Cleared,
+                    QStringLiteral("COMM_LOST"), id)
+            == 1,
+        25000);
+}
+
+// S6 E2E 之四(TC-ALARM-003 后半):Stop ACK 后采集暂停,陈旧检测整设备豁免
+// ——心跳保 Online、静默 > 陈旧阈不产生 DATA_STALE;Start 后采集恢复仍零误报
+void TestIntegration::acquisitionPauseExemptsStaleAlarm()
+{
+    QVERIFY(sim_.start(1, 100, {}));
+
+    const QString id = QStringLiteral("itest-15");
+    dms::domain::DeviceSetup setup;
+    setup.deviceId = id;
+    setup.transport.deviceId = id;
+    setup.transport.host = QStringLiteral("127.0.0.1");
+    setup.transport.port = sim_.portAt(0);
+
+    DeviceManager manager;
+    dms::domain::AlarmEngine engine{dms::domain::AlarmEngine::Settings{}};
+    connectAlarmPipeline(&manager, &engine);
+    QSignalSpy alarmSpy(&engine, &dms::domain::AlarmEngine::alarmEvent);
+    QSignalSpy telSpy(&manager, &DeviceManager::deviceTelemetry);
+    QSignalSpy stateSpy(&manager, &DeviceManager::deviceStateChanged);
+    QSignalSpy finishedSpy(&manager, &DeviceManager::deviceCommandFinished);
+
+    engine.start();
+    manager.applySetups({setup});
+    QTRY_VERIFY_WITH_TIMEOUT(telSpy.size() >= 3, 8000);
+
+    // Stop(Succeeded):会话侧停发遥测只留心跳,引擎侧豁免陈旧检测
+    manager.sendCommand(id, kCmdStop);
+    QTRY_VERIFY_WITH_TIMEOUT(findManagerFinished(finishedSpy, kCmdStop), 3000);
+    const int telAtStop = telSpy.size();
+
+    // 静默 3600ms(> 3000ms 陈旧阈):心跳维持 Online,零 DATA_STALE
+    {
+        QElapsedTimer w;
+        w.start();
+        WAIT_UNTIL(w, 3600);
+    }
+    QCOMPARE(countAlarms(alarmSpy, dms::domain::AlarmEvent::Kind::Triggered,
+                         QStringLiteral("DATA_STALE"), id),
+             0);
+    for (const QList<QVariant> &args : stateSpy)
+        QVERIFY2(args.at(1).value<SessionState>() != SessionState::Degraded,
+                 "Stop 豁免期不应降级");
+
+    // Start:遥测恢复,全程无一次 DATA_STALE 误报
+    manager.sendCommand(id, kCmdStart);
+    QTRY_VERIFY_WITH_TIMEOUT(findManagerFinished(finishedSpy, kCmdStart), 3000);
+    QTRY_VERIFY_WITH_TIMEOUT(telSpy.size() > telAtStop, 4000);
+    QCOMPARE(countAlarms(alarmSpy, dms::domain::AlarmEvent::Kind::Triggered,
+                         QStringLiteral("DATA_STALE"), id),
+             0);
 }
 
 QTEST_MAIN(TestIntegration)

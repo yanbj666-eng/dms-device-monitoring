@@ -8,17 +8,19 @@
 #include <QThread>
 
 #include "Config.h"
+#include "domain/AlarmEngine.h"
 #include "domain/DeviceManager.h"
 #include "persistence/DatabaseWorker.h"
 #include "ui/MainWindow.h"
 #include "common/Logging.h"
 
-// 上位机装配(S4+S5):
+// 上位机装配(S4+S5+S6):
 //   GUI 线程:QApplication + MainWindow + QThread 管理;
-//   IO 线程:DeviceManager worker-object(无 parent → moveToThread →
-//   started 槽里 applySetups,会话与 socket 全部 IO 线程亲和,HLD §2);
+//   IO 线程:DeviceManager + AlarmEngine 双 worker-object(无 parent →
+//   moveToThread → started 槽里装配,会话/socket/裁决定时器全 IO 线程亲和,HLD §2);
 //   DB 线程(S5):DatabaseWorker 同模式,GUI/IO 只经 queued 信号喂数据;
-//   退出顺序(HLD §4):停会话 → IO 收线程 → DB 排空或上报未提交 → DB 收线程
+//   退出顺序(HLD §4):停会话(引擎补发 manual_disconnect 恢复事件)→
+//   IO 收线程 → DB 排空或上报未提交 → DB 收线程
 int main(int argc, char *argv[])
 {
     QApplication app(argc, argv);
@@ -96,9 +98,45 @@ int main(int argc, char *argv[])
     auto *manager = new dms::domain::DeviceManager;
     manager->moveToThread(&ioThread);
     QObject::connect(&ioThread, &QThread::finished, manager, &QObject::deleteLater);
-    QObject::connect(&ioThread, &QThread::started, manager, [manager, setups] {
-        manager->applySetups(setups); // connectOnStart=true:装配即连接
-    });
+
+    // S6 告警引擎:与 manager 同住 IO 线程。评估参数从 [connection] 同源映射
+    // (LLD §3/§6 引用同一组阈值,避免第二套配置漂移),规则按设备注入;
+    // Config 层已保证 low<high、迟滞域内,引擎信任规则(docs/15 §4)
+    dms::domain::AlarmEngine::Settings engineSettings;
+    engineSettings.pollIntervalMs = loaded.app.session.pollIntervalMs;
+    engineSettings.staleTimeoutMs = loaded.app.session.metricTimeoutMs;
+    engineSettings.badCrcTrigger = loaded.app.session.consecutiveBadCrcLimit;
+    engineSettings.goodFramesToClearCrc = loaded.app.session.goodFramesToRecoverOnline;
+    auto *alarmEngine = new dms::domain::AlarmEngine(engineSettings);
+    alarmEngine->moveToThread(&ioThread);
+    QObject::connect(&ioThread, &QThread::finished, alarmEngine,
+                      &QObject::deleteLater);
+
+    // 规则快照在 GUI 线程建好,started 槽里随会话一起注入(同线程,免锁)
+    QHash<QString, QList<dms::domain::AlarmRule>> alarmRules;
+    for (const dms::app::DeviceConnectionConfig &dev : loaded.devices) {
+        if (dev.transport != QStringLiteral("tcp") || !dev.enabled)
+            continue; // 只有建会话的设备才评估
+        QList<dms::domain::AlarmRule> rules;
+        for (const dms::app::AlarmRuleConfig &r : dev.alarmRules) {
+            dms::domain::AlarmRule rule;
+            rule.metricId = r.metricId;
+            rule.low = r.low;
+            rule.high = r.high;
+            rule.hysteresis = r.hysteresis;
+            rules.append(rule);
+        }
+        alarmRules.insert(dev.id, rules);
+    }
+
+    QObject::connect(&ioThread, &QThread::started, manager,
+                     [manager, setups, alarmEngine, alarmRules] {
+                         for (auto it = alarmRules.cbegin();
+                              it != alarmRules.cend(); ++it)
+                             alarmEngine->setRules(it.key(), it.value());
+                         alarmEngine->start(); // 裁决定时器建在本线程(亲和)
+                         manager->applySetups(setups); // connectOnStart=true:装配即连接
+                     });
 
     // DB 线程(S5):app.ini [database] → DbWorkerSettings;
     // path 是运行根下相对路径,装配层解析成绝对路径(docs/15 §4)
@@ -141,6 +179,26 @@ int main(int argc, char *argv[])
                      &dms::persistence::DatabaseWorker::onCommandSubmitted);
     QObject::connect(manager, &dms::domain::DeviceManager::deviceCommandFinished,
                      dbWorker, &dms::persistence::DatabaseWorker::onCommandFinished);
+
+    // manager → 引擎:两者同住 IO 线程,auto 连接解析为 direct,
+    // 值对象零拷贝直达裁决点(LLD §6 四类告警的输入面)
+    QObject::connect(manager, &dms::domain::DeviceManager::deviceTelemetry, alarmEngine,
+                     &dms::domain::AlarmEngine::onTelemetry);
+    QObject::connect(manager, &dms::domain::DeviceManager::deviceStateChanged,
+                     alarmEngine, &dms::domain::AlarmEngine::onSessionState);
+    QObject::connect(manager, &dms::domain::DeviceManager::deviceProtocolHealth,
+                     alarmEngine, &dms::domain::AlarmEngine::onProtocolHealth);
+    QObject::connect(manager, &dms::domain::DeviceManager::deviceCommandFinished,
+                     alarmEngine, &dms::domain::AlarmEngine::onCommandFinished);
+
+    // 引擎唯一出口分流:DB 落库与 GUI 显示,均为 queued 传 AlarmEvent 值对象;
+    // GUI 确认请求反方向 queued 进引擎,结果仍经 alarmEvent 异步广播,不返回值
+    QObject::connect(alarmEngine, &dms::domain::AlarmEngine::alarmEvent, dbWorker,
+                     &dms::persistence::DatabaseWorker::onAlarmEvent);
+    QObject::connect(alarmEngine, &dms::domain::AlarmEngine::alarmEvent, &window,
+                     &dms::ui::MainWindow::onAlarmEvent);
+    QObject::connect(&window, &dms::ui::MainWindow::alarmAckRequested, alarmEngine,
+                     &dms::domain::AlarmEngine::acknowledge);
     // 建库失败不拖垮通信与显示(docs/06 §5):GUI 提示一次,
     // worker 侧继续显式计数丢弃,连接/曲线照常
     QObject::connect(dbWorker, &dms::persistence::DatabaseWorker::dbFatal, &window,
