@@ -49,6 +49,11 @@ QByteArray telemetryFrame(quint32 seq, quint64 ts, const QList<TelemetrySample> 
                                       dms::protocol::MessageCodec::encodeTelemetry(samples));
 }
 
+QByteArray heartbeatFrame(quint32 seq)
+{
+    return dms::protocol::encodeFrame(quint8(MessageType::Heartbeat), seq, 0, {});
+}
+
 QByteArray ackFrame(quint32 seq, quint16 commandId, AckStatus status)
 {
     return dms::protocol::encodeFrame(quint8(MessageType::CommandAck), seq, 0,
@@ -77,6 +82,10 @@ struct Captured
     QString lastErrorId;
     dms::ErrorCode lastErrorCode = dms::ErrorCode::None;
     int managerStoppedCount = 0;
+    QString lastHealthId; // S6:deviceProtocolHealth 转发
+    quint32 lastHealthBad = 0;
+    quint32 lastHealthGood = 0;
+    int healthCount = 0;
 };
 
 void captureAll(DeviceManager *manager, Captured *out)
@@ -109,6 +118,13 @@ void captureAll(DeviceManager *manager, Captured *out)
                      });
     QObject::connect(manager, &DeviceManager::managerStopped,
                      [out]() { out->managerStoppedCount++; });
+    QObject::connect(manager, &DeviceManager::deviceProtocolHealth,
+                     [out](const QString &id, quint32 bad, quint32 good) {
+                         out->healthCount++;
+                         out->lastHealthId = id;
+                         out->lastHealthBad = bad;
+                         out->lastHealthGood = good;
+                     });
 }
 
 DeviceSetup setupFor(const QString &id)
@@ -137,6 +153,7 @@ private slots:
     void stopAllStopsEverything();
     void startStopDeviceById();
     void errorForwardedWithDeviceId();
+    void protocolHealthForwardedWithDeviceId();
 };
 
 void TestDeviceManager::applySetupsCreatesAndStarts()
@@ -212,6 +229,32 @@ void TestDeviceManager::telemetryForwardedWithDeviceId()
     // 首条有效遥测 → Online
     QVERIFY(captured.stateOrder.contains(QStringLiteral("d1:Online")));
     QVERIFY(!captured.stateOrder.contains(QStringLiteral("d2:Online")));
+}
+
+// S6:protocolHealth 转发带 deviceId,坏/好计数不改(告警引擎同线程直连)
+void TestDeviceManager::protocolHealthForwardedWithDeviceId()
+{
+    DeviceManager manager;
+    QHash<QString, FakeTransport *> transports;
+    manager.setTransportFactory([&transports](const DeviceSetup &setup) {
+        auto *t = new FakeTransport;
+        transports.insert(setup.deviceId, t);
+        return t;
+    });
+
+    Captured captured;
+    captureAll(&manager, &captured);
+    manager.applySetups({setupFor(QStringLiteral("d1")), setupFor(QStringLiteral("d2"))});
+
+    QByteArray bad = heartbeatFrame(1); // 心跳帧 + CRC 翻转
+    bad[bad.size() - 1] = char(uchar(bad[bad.size() - 1]) ^ 0xFF);
+    transports.value(QStringLiteral("d2"))->feed(bad);
+    transports.value(QStringLiteral("d1"))->feed(heartbeatFrame(2));
+
+    QCOMPARE(captured.healthCount, 2);
+    QCOMPARE(captured.lastHealthId, QStringLiteral("d1"));
+    QCOMPARE(captured.lastHealthBad, 0u);
+    QCOMPARE(captured.lastHealthGood, 1u);
 }
 
 void TestDeviceManager::sendCommandRoutesAndFinishes()

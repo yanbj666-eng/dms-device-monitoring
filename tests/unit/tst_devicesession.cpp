@@ -187,6 +187,12 @@ private slots:
     void commandFailedOnLocalWriteError();
     void commandFailedOnSendQueueFull();
 
+    // ---- S6:协议健康信号 + 采集启停 ----
+    void protocolHealthCountsBadAndGoodFrames();
+    void protocolHealthSkipsPayloadRejectedAndBadHeader();
+    void stopAckExemptsStaleFromHealthCheck();
+    void startAckResumesStaleWindow();
+
 private:
     QTemporaryDir tempRoot_;
     QString freshDir();
@@ -898,6 +904,99 @@ void TestDeviceSession::commandFailedOnSendQueueFull()
     QVERIFY(findOutcome(finSpy, seq, out));
     QCOMPARE(out.state, CommandState::Failed);
     QCOMPARE(rig.session->state(), SessionState::Online); // 不降级不失联
+}
+
+// ---- S6 ----
+
+// 每解码块的坏/好帧快照:告警引擎 PROTOCOL_CRC 的唯一输入
+void TestDeviceSession::protocolHealthCountsBadAndGoodFrames()
+{
+    auto *transport = new FakeTransport;
+    DeviceSession session(QStringLiteral("sim-tcp-01"), transport);
+    QSignalSpy spy(&session, &DeviceSession::protocolHealth);
+
+    QByteArray bad = heartbeatFrame(1);
+    bad[bad.size() - 1] = char(uchar(bad[bad.size() - 1]) ^ 0xFF); // 破坏 CRC
+    transport->feed(bad);
+    QCOMPARE(spy.size(), 1);
+    QCOMPARE(spy.last().at(0).toUInt(), 1u); // badCrc
+    QCOMPARE(spy.last().at(1).toUInt(), 0u);
+
+    transport->feed(heartbeatFrame(2));
+    QCOMPARE(spy.size(), 2);
+    QCOMPARE(spy.last().at(0).toUInt(), 0u);
+    QCOMPARE(spy.last().at(1).toUInt(), 1u);
+
+    // 同一块"坏+好+好":一次信号合并计数(告警引擎按块累积 streak)
+    transport->feed(QByteArray(bad + heartbeatFrame(3) + heartbeatFrame(4)));
+    QCOMPARE(spy.size(), 3);
+    QCOMPARE(spy.last().at(0).toUInt(), 1u);
+    QCOMPARE(spy.last().at(1).toUInt(), 2u);
+}
+
+// 载荷拒绝(NaN)与坏头不计入好帧:与 noteValidReceive 同口径,
+// 它们不能解除连续坏 CRC(LLD §2/§6)
+void TestDeviceSession::protocolHealthSkipsPayloadRejectedAndBadHeader()
+{
+    auto *transport = new FakeTransport;
+    DeviceSession session(QStringLiteral("sim-tcp-01"), transport);
+    QSignalSpy spy(&session, &DeviceSession::protocolHealth);
+
+    // NaN temperature TLV:0001 01 04 7fc00000
+    const QByteArray nanTlv = QByteArray::fromHex("000101047fc00000");
+    transport->feed(telemetryFrame(1, 100, {}, nanTlv));
+    QCOMPARE(spy.size(), 0); // 整帧拒绝,非有效帧
+
+    QByteArray badVersion = heartbeatFrame(5);
+    badVersion[2] = 0x02; // 头非法:不进坏 CRC 计数
+    transport->feed(badVersion);
+    QCOMPARE(spy.size(), 0);
+
+    transport->feed(heartbeatFrame(6));
+    QCOMPARE(spy.size(), 1);
+    QCOMPARE(spy.last().at(1).toUInt(), 1u);
+}
+
+// Stop 确认后:遥测长期缺席不再把 Online 拉成 Degraded(LLD §6 免除条件)
+void TestDeviceSession::stopAckExemptsStaleFromHealthCheck()
+{
+    Rig rig;
+    rig.goOnline();
+    const quint32 seq = rig.session->sendCommand(dms::protocol::CommandId::Stop);
+    QVERIFY(seq != 0);
+    rig.transport->feed(ackFrame(seq, dms::protocol::CommandId::Stop, AckStatus::Success));
+
+    // Stop 后只有心跳:指标年龄涨到 4000ms(超 metricTimeout)仍留 Online
+    for (int i = 0; i < 4; ++i) {
+        rig.advance(1000);
+        rig.transport->feed(heartbeatFrame(200 + quint32(i), quint64(rig.now)));
+    }
+    QCOMPARE(rig.session->state(), SessionState::Online);
+}
+
+// Start 确认后陈旧窗口重新起算:窗口内 Online,到点恢复陈旧降级
+void TestDeviceSession::startAckResumesStaleWindow()
+{
+    Rig rig;
+    rig.goOnline();
+
+    quint32 seq = rig.session->sendCommand(dms::protocol::CommandId::Stop);
+    rig.transport->feed(ackFrame(seq, dms::protocol::CommandId::Stop, AckStatus::Success));
+    for (int i = 0; i < 3; ++i) { // 暂停期:静默 3s 不降级
+        rig.advance(1000);
+        rig.transport->feed(heartbeatFrame(300 + quint32(i), quint64(rig.now)));
+    }
+    QCOMPARE(rig.session->state(), SessionState::Online);
+
+    seq = rig.session->sendCommand(dms::protocol::CommandId::Start);
+    rig.transport->feed(ackFrame(seq, dms::protocol::CommandId::Start, AckStatus::Success));
+
+    rig.advance(2999); // Start 重置计时后窗口内
+    rig.transport->feed(heartbeatFrame(400, quint64(rig.now)));
+    QCOMPARE(rig.session->state(), SessionState::Online);
+
+    rig.advance(1); // 恰 3000ms:陈旧检测恢复,降级
+    QCOMPARE(rig.session->state(), SessionState::Degraded);
 }
 
 QTEST_MAIN(TestDeviceSession)

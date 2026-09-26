@@ -146,6 +146,10 @@ void DeviceManager::createSession(const DeviceSetup &setup)
             [this, id](quint32 seq, quint64 timestampMs) {
                 emit deviceHeartbeat(id, seq, timestampMs);
             });
+    connect(session, &DeviceSession::protocolHealth, this,
+            [this, id](quint32 badCrcFrames, quint32 goodFrames) {
+                emit deviceProtocolHealth(id, badCrcFrames, goodFrames);
+            });
     connect(session, &DeviceSession::commandSent, this,
             [this, id](quint32 seq, quint16 commandId) {
                 emit deviceCommandSent(id, seq, commandId);

@@ -70,6 +70,7 @@ signals:
     void deviceStateChanged(QString deviceId, dms::domain::SessionState state);
     void deviceTelemetry(QString deviceId, dms::domain::TelemetryBatch batch);
     void deviceHeartbeat(QString deviceId, quint32 seq, quint64 timestampMs);
+    void deviceProtocolHealth(QString deviceId, quint32 badCrcFrames, quint32 goodFrames);
     void deviceCommandSent(QString deviceId, quint32 seq, quint16 commandId);
     void deviceCommandFinished(QString deviceId, dms::domain::CommandOutcome outcome);
     void deviceError(QString deviceId, dms::ErrorCode code, QString message);

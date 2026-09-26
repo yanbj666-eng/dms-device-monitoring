@@ -271,15 +271,21 @@ void DeviceSession::onBytesReceived(const QByteArray &bytes)
                             .arg(r.unknownTypeFrames));
     }
 
+    // 有效帧计数:心跳/遥测/ACK 且载荷通过才计入(与 noteValidReceive 同口径,
+    // 载荷拒绝的遥测不算"好帧",不解除连续坏 CRC)
+    quint32 goodFrames = 0;
     for (const DecodedFrame &f : r.frames) {
         if (f.type == quint8(MessageType::Heartbeat)) {
             ++framesReceived_;
+            ++goodFrames;
             noteValidReceive(); // 心跳刷新存活,但不刷新遥测时间(LLD §3)
             emit heartbeatReceived(f.seq, f.timestampMs);
         } else if (f.type == quint8(MessageType::Telemetry)) {
-            handleTelemetry(f);
+            if (handleTelemetry(f))
+                ++goodFrames;
         } else if (f.type == quint8(MessageType::CommandAck)) {
-            handleCommandAck(f);
+            if (handleCommandAck(f))
+                ++goodFrames;
         } else {
             // 客户端会话不该收到设备侧 COMMAND;已知类型里只有这一种剩余情况
             dms::logMessage(dms::LogLevel::Warn, dms::LogCategory::Protocol,
@@ -288,6 +294,10 @@ void DeviceSession::onBytesReceived(const QByteArray &bytes)
                                 .arg(f.seq));
         }
     }
+
+    // 协议健康单块快照:纯坏头/垃圾块(两者皆 0)不发,避免空信号噪声
+    if (r.badCrcFrames > 0 || goodFrames > 0)
+        emit protocolHealth(r.badCrcFrames, goodFrames);
 
     // 组帧滞留计时:出现半包起算,清空即止(超时判定在 checkTimeouts)
     if (decoder_.bufferedBytes() > 0) {
@@ -298,7 +308,7 @@ void DeviceSession::onBytesReceived(const QByteArray &bytes)
     }
 }
 
-void DeviceSession::handleTelemetry(const DecodedFrame &frame)
+bool DeviceSession::handleTelemetry(const DecodedFrame &frame)
 {
     TelemetryResult result;
     if (MessageCodec::decodeTelemetry(frame.payload, result) != DecodeError::None) {
@@ -307,7 +317,7 @@ void DeviceSession::handleTelemetry(const DecodedFrame &frame)
         dms::logMessage(dms::LogLevel::Warn, dms::LogCategory::Protocol,
                         logCtx(dms::ErrorCode::FramePayload),
                         QStringLiteral("telemetry payload rejected, seq=%1").arg(frame.seq));
-        return;
+        return false;
     }
 
     ++framesReceived_;
@@ -320,9 +330,10 @@ void DeviceSession::handleTelemetry(const DecodedFrame &frame)
     batch.timestampMs = frame.timestampMs;
     batch.sessionId = sessionId_;
     emit telemetryReceived(batch);
+    return true;
 }
 
-void DeviceSession::handleCommandAck(const DecodedFrame &frame)
+bool DeviceSession::handleCommandAck(const DecodedFrame &frame)
 {
     quint16 commandId = 0;
     AckStatus status = AckStatus::Failed;
@@ -331,19 +342,32 @@ void DeviceSession::handleCommandAck(const DecodedFrame &frame)
         dms::logMessage(dms::LogLevel::Warn, dms::LogCategory::Protocol,
                         logCtx(dms::ErrorCode::FramePayload),
                         QStringLiteral("malformed ack payload, seq=%1").arg(frame.seq));
-        return;
+        return false;
     }
 
     ++framesReceived_;
     noteValidReceive();
     emit commandAckReceived(frame.seq, commandId, quint16(status));
-    if (auto outcome = commands_.onAck(frame.seq, commandId, quint16(status)))
+    if (auto outcome = commands_.onAck(frame.seq, commandId, quint16(status))) {
         // 与超时/取消/失败路径一致,经 finishPending 补 sessionId 再发射(S5 落库依赖)
         finishPending(outcome);
-    else
+        // 设备确认过的采集启停才影响健康判定(LLD §6):Rejected/超时结果
+        // 未知,不臆断;Start 重新起算陈旧窗口
+        if (outcome->state == CommandState::Succeeded) {
+            if (outcome->commandId == dms::protocol::CommandId::Stop) {
+                acquisitionActive_ = false;
+            } else if (outcome->commandId == dms::protocol::CommandId::Start) {
+                acquisitionActive_ = true;
+                for (qint64 &t : metricLastMs_)
+                    t = clock_();
+            }
+        }
+    } else {
         // 迟到/重复/无关 ACK:只记日志,不修改已结束结果(LLD §4)
         dms::logMessage(dms::LogLevel::Debug, dms::LogCategory::Protocol, logCtx(),
                         QStringLiteral("unmatched ack ignored, seq=%1").arg(frame.seq));
+    }
+    return true;
 }
 
 void DeviceSession::onTransportError(const dms::transport::TransportError &error)
@@ -407,6 +431,10 @@ void DeviceSession::noteTelemetryMetrics(const QList<dms::protocol::TelemetrySam
 
 bool DeviceSession::metricsAllFresh(qint64 now) const
 {
+    // 采集被设备确认停止时,陈旧条件不参与健康判定(LLD §6):
+    // Stop 后心跳仍活,会话必须能稳定留在 Online
+    if (!acquisitionActive_)
+        return true;
     for (qint64 t : metricLastMs_)
         if (now - t >= config_.metricTimeoutMs)
             return false;
@@ -415,6 +443,8 @@ bool DeviceSession::metricsAllFresh(qint64 now) const
 
 bool DeviceSession::anyMetricStale(qint64 now) const
 {
+    if (!acquisitionActive_)
+        return false; // 同上:免除被明确停止的遥测新鲜条件
     for (qint64 t : metricLastMs_)
         if (now - t >= config_.metricTimeoutMs)
             return true;

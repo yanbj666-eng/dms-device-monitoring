@@ -127,6 +127,10 @@ signals:
     void commandSent(quint32 seq, quint16 commandId);
     void commandFinished(dms::domain::CommandOutcome outcome);
     void sessionError(dms::ErrorCode code, QString message);
+    // 每个解码块的协议健康(S6 告警引擎消费,LLD §6):
+    // 坏 CRC 帧数 + 有效帧数(心跳/遥测/ACK,CRC 与载荷都通过)。
+    // 同一块先计坏帧后计好帧,与会话自身 streak 更新顺序一致
+    void protocolHealth(quint32 badCrcFrames, quint32 goodFrames);
 
 private:
     void onTransportOpened();
@@ -134,8 +138,9 @@ private:
     void onWriteAccepted(quint64 requestId);
     void onBytesReceived(const QByteArray &bytes);
     void onTransportError(const dms::transport::TransportError &error);
-    void handleTelemetry(const dms::protocol::DecodedFrame &frame);
-    void handleCommandAck(const dms::protocol::DecodedFrame &frame);
+    // 返回"是否有效帧"(载荷通过):onBytesReceived 据此计 protocolHealth 的好帧数
+    bool handleTelemetry(const dms::protocol::DecodedFrame &frame);
+    bool handleCommandAck(const dms::protocol::DecodedFrame &frame);
 
     void setState(SessionState next);
     // 失联/建链失败/首帧超时的统一入口:取消未决命令、关旧 transport、排退避
@@ -178,6 +183,10 @@ private:
     quint32 badHeaderFrames_ = 0;
     quint32 unknownTypeFrames_ = 0;
     quint32 payloadErrors_ = 0;
+    // 采集启停(S6,LLD §6"Stop 已 ACK 后暂停遥测陈旧检测"):
+    // 设备确认 Stop 后,指标陈旧不再把 Online 拉成 Degraded;
+    // Start 确认后重新计时。只认 ACK 成功,不臆断未确认命令的执行结果
+    bool acquisitionActive_ = true;
 };
 
 } // namespace dms::domain
