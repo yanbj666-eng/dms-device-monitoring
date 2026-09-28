@@ -17,6 +17,7 @@
 #include <QTemporaryDir>
 #include <QUdpSocket>
 #include <QSerialPortInfo>
+#include <QFileInfo>
 #include <QtEndian>
 
 #include <algorithm>
@@ -1297,6 +1298,16 @@ void TestIntegration::serialLinkEndToEnd()
     for (const QSerialPortInfo &info : QSerialPortInfo::availablePorts())
         if (info.portName().compare(dmsPort, Qt::CaseInsensitive) == 0)
             dmsPortPresent = true;
+    // Linux 回退:socat 的 pty 属 devpts,无 sysfs 表示,不进 availablePorts()
+    // 所依赖的 udev/tty 枚举(Windows 的 com0com 端口能枚举到)。按设备节点
+    // 存在性判断,QSerialPort 对绝对路径/ /dev 下相对路径均可直开。
+    // Windows 下 COM 名不走 /dev,该回退天然不生效,不改变原有跳过语义
+    if (!dmsPortPresent) {
+        const QString node = dmsPort.startsWith(QLatin1Char('/'))
+                                 ? dmsPort
+                                 : QStringLiteral("/dev/") + dmsPort;
+        dmsPortPresent = QFileInfo::exists(node);
+    }
     if (!dmsPortPresent)
         QSKIP(QStringLiteral("DMS 侧端口 %1 不存在,请核对 com0com/socat 配置")
                   .arg(dmsPort)

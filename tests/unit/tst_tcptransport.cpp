@@ -160,6 +160,12 @@ void TestTcpTransport::sendQueueFull()
     QTRY_COMPARE(openedSpy.size(), 1);
     QTRY_VERIFY(peer.client() != nullptr);
 
+    // 关键前置:QAbstractSocket 默认 readBufferSize=0(不限量),会把内核收包
+    // 持续搬进用户态堆缓冲,发送侧内核缓冲永远清空——Linux 回环内核缓冲还能
+    // 自动调谐到 MB 级,32MiB 也塞不满,上限永不触发。对端封顶后停止排空内核,
+    // rmem 填满 → 发送侧 bytesToWrite 堆积 → 64KiB 上限确定触发(跨平台确定性)
+    peer.client()->setReadBufferSize(4096);
+
     // 64KiB × 512 = 32MiB,远超任何回环缓冲;对端应用层一直不读
     const QByteArray chunk(65536, 'x');
     for (int i = 0; i < 512 && errorSpy.isEmpty(); ++i) {

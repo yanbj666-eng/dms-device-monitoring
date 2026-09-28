@@ -14,7 +14,9 @@ set(CMAKE_AUTOMOC ON)
 # Widgets:S4 最小 UI(GUI 随 Widgets 传递引入)
 # Sql:QSqlDatabase/QSQLITE(S5 持久化)
 # SerialPort:QSerialPort(S7 串口传输与模拟器)
-find_package(Qt6 6.8 REQUIRED COMPONENTS Core Network Test Widgets Sql SerialPort)
+# 最低支持 6.4:Windows 用 6.8.3,WSL Ubuntu 24.04 apt 源为 6.4.2——
+# 同代码跨 Qt 小版本本身就是 S8 跨平台验收要覆盖的维度,不强行拉高门槛
+find_package(Qt6 6.4 REQUIRED COMPONENTS Core Network Test Widgets Sql SerialPort)
 
 enable_testing()
 

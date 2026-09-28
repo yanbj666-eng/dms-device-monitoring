@@ -141,33 +141,8 @@ DeviceSetup setupFor(const QString &id)
     return setup;
 }
 
-// UDP/Serial 分支的 setup(variant 活化 + transportKind 填充,装配同构)
-DeviceSetup udpSetupFor(const QString &id, quint16 bindPort, quint16 peerPort)
-{
-    DeviceSetup setup;
-    setup.deviceId = id;
-    dms::transport::UdpTransportConfig cfg;
-    cfg.deviceId = id;
-    cfg.bindAddress = QHostAddress(QHostAddress::LocalHost);
-    cfg.bindPort = bindPort;
-    cfg.peerAddress = QHostAddress(QHostAddress::LocalHost);
-    cfg.peerPort = peerPort;
-    setup.transport = cfg;
-    setup.session.transportKind = dms::transport::TransportKind::Udp;
-    return setup;
-}
-
-DeviceSetup serialSetupFor(const QString &id, const QString &portName)
-{
-    DeviceSetup setup;
-    setup.deviceId = id;
-    dms::transport::SerialTransportConfig cfg;
-    cfg.deviceId = id;
-    cfg.portName = portName;
-    setup.transport = cfg;
-    setup.session.transportKind = dms::transport::TransportKind::Serial;
-    return setup;
-}
+// UDP/Serial variant 分支的 E2E 已覆盖于 tst_integration(TC-SERIAL/UDP),
+// 此处不再预留工厂(g++ -Wunused-function 会咬住匿名命名空间死代码)
 
 } // namespace
 

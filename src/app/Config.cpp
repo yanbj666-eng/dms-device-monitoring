@@ -2,6 +2,7 @@
 
 #include <QDir>
 #include <QFile>
+#include <QHash>
 #include <QHostAddress>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -441,13 +442,13 @@ void parseDevicesJson(const QByteArray &bytes, QList<DeviceConnectionConfig> *de
 
 // ---- app.ini ----
 
-// 整型键:缺失取默认;类型错/越界记 issue(QSettings 的 INI 值都是字符串,必须带 ok 判)
-qint64 iniInt(const QSettings &s, const QString &key, qint64 minV, qint64 maxV,
-              qint64 fallback, Issues *issues)
+// 整型键:缺失取默认;类型错/越界记 issue(INI 值都是字符串,必须带 ok 判)
+qint64 iniInt(const QHash<QString, QString> &folded, const QString &key, qint64 minV,
+              qint64 maxV, qint64 fallback, Issues *issues)
 {
-    if (!s.contains(key))
+    if (!folded.contains(key.toLower()))
         return fallback;
-    const QString raw = s.value(key).toString().trimmed();
+    const QString raw = folded.value(key.toLower()).trimmed();
     bool ok = false;
     const qint64 v = raw.toLongLong(&ok);
     if (!ok) {
@@ -461,7 +462,7 @@ qint64 iniInt(const QSettings &s, const QString &key, qint64 minV, qint64 maxV,
     return v;
 }
 
-// app.ini 全部合法键(docs/15 §4;QSettings 对 INI 键做大小写折叠,比较前同样折叠)
+// app.ini 全部合法键(docs/15 §4);键大小写契约在装载器内折叠实现,不依赖后端
 QStringList knownIniKeys()
 {
     return {
@@ -521,6 +522,13 @@ void parseAppIni(const QString &iniPath, AppConfig *app, Issues *issues)
     Issues local;
     QSettings ini(iniPath, QSettings::IniFormat);
 
+    // 键折叠自己做:QSettings INI 后端的匹配语义随 Qt 版本漂移(6.8.3 代为
+    // 大小写折叠,6.4.2 按文件原样匹配)。契约要的是"键不区分大小写",
+    // 白名单校验与取值必须同源——都走这张折叠表,行为与 Qt 版本/平台无关
+    QHash<QString, QString> folded;
+    for (const QString &key : ini.allKeys())
+        folded.insert(key.toLower(), ini.value(key).toString());
+
     QSet<QString> knownSet;
     for (const QString &k : knownIniKeys())
         knownSet.insert(k.toLower());
@@ -530,10 +538,10 @@ void parseAppIni(const QString &iniPath, AppConfig *app, Issues *issues)
     }
 
     // [app]
-    if (!ini.contains(QStringLiteral("app/schema_version"))) {
+    if (!folded.contains(QStringLiteral("app/schema_version"))) {
         local.add(QStringLiteral("app/schema_version"), QStringLiteral("缺失必填键"));
     } else {
-        const QString raw = ini.value(QStringLiteral("app/schema_version")).toString().trimmed();
+        const QString raw = folded.value(QStringLiteral("app/schema_version")).trimmed();
         bool ok = false;
         const qint64 schemaVersion = raw.toLongLong(&ok);
         if (!ok || schemaVersion != 1)
@@ -543,70 +551,70 @@ void parseAppIni(const QString &iniPath, AppConfig *app, Issues *issues)
 
     // [connection] / [protocol] → SessionConfig + TcpTransportConfig
     app->transport.connectTimeoutMs = int(iniInt(
-        ini, QStringLiteral("connection/connect_timeout_ms"), 100, 3000,
+        folded, QStringLiteral("connection/connect_timeout_ms"), 100, 3000,
         app->transport.connectTimeoutMs, &local));
     app->heartbeatIntervalMs = int(iniInt(
-        ini, QStringLiteral("connection/heartbeat_interval_ms"), 100, 1000,
+        folded, QStringLiteral("connection/heartbeat_interval_ms"), 100, 1000,
         app->heartbeatIntervalMs, &local));
     app->session.offlineTimeoutMs = int(iniInt(
-        ini, QStringLiteral("connection/offline_timeout_ms"), 300, 4500,
+        folded, QStringLiteral("connection/offline_timeout_ms"), 300, 4500,
         app->session.offlineTimeoutMs, &local));
     app->session.pollIntervalMs = int(iniInt(
-        ini, QStringLiteral("connection/health_check_ms"), 10, 100,
+        folded, QStringLiteral("connection/health_check_ms"), 10, 100,
         app->session.pollIntervalMs, &local));
     app->session.metricTimeoutMs = int(iniInt(
-        ini, QStringLiteral("connection/stale_timeout_ms"), 1000, 4500,
+        folded, QStringLiteral("connection/stale_timeout_ms"), 1000, 4500,
         app->session.metricTimeoutMs, &local));
     app->session.commandAckTimeoutMs = int(iniInt(
-        ini, QStringLiteral("connection/command_timeout_ms"), 100, 2000,
+        folded, QStringLiteral("connection/command_timeout_ms"), 100, 2000,
         app->session.commandAckTimeoutMs, &local));
     app->session.reconnectMaxMs = int(iniInt(
-        ini, QStringLiteral("connection/reconnect_max_ms"), 1000, 10000,
+        folded, QStringLiteral("connection/reconnect_max_ms"), 1000, 10000,
         app->session.reconnectMaxMs, &local));
     app->session.frameAssemblyTimeoutMs = int(iniInt(
-        ini, QStringLiteral("protocol/assembly_timeout_ms"), 100, 2000,
+        folded, QStringLiteral("protocol/assembly_timeout_ms"), 100, 2000,
         app->session.frameAssemblyTimeoutMs, &local));
     app->session.decoderMaxBufferBytes = int(iniInt(
-        ini, QStringLiteral("protocol/max_buffer_bytes"), 4118, 1048576,
+        folded, QStringLiteral("protocol/max_buffer_bytes"), 4118, 1048576,
         app->session.decoderMaxBufferBytes, &local));
     app->transport.maxTxBytes = int(iniInt(
-        ini, QStringLiteral("protocol/max_tx_bytes"), 4118, 1048576,
+        folded, QStringLiteral("protocol/max_tx_bytes"), 4118, 1048576,
         app->transport.maxTxBytes, &local));
 
     // [ui]
     app->refreshIntervalMs = int(iniInt(
-        ini, QStringLiteral("ui/refresh_interval_ms"), 100, 200,
+        folded, QStringLiteral("ui/refresh_interval_ms"), 100, 200,
         app->refreshIntervalMs, &local));
     app->curvePoints = int(iniInt(
-        ini, QStringLiteral("ui/curve_points"), 10, 6000, app->curvePoints, &local));
+        folded, QStringLiteral("ui/curve_points"), 10, 6000, app->curvePoints, &local));
 
     // [database](S5 消费,现在只校验与存储)
-    if (ini.contains(QStringLiteral("database/path"))) {
-        const QString raw = ini.value(QStringLiteral("database/path")).toString();
+    if (folded.contains(QStringLiteral("database/path"))) {
+        const QString raw = folded.value(QStringLiteral("database/path"));
         app->db.path = raw;
         validateDbPath(raw, &local);
     }
     app->db.batchSamples = int(iniInt(
-        ini, QStringLiteral("database/batch_samples"), 1, 5000, app->db.batchSamples, &local));
+        folded, QStringLiteral("database/batch_samples"), 1, 5000, app->db.batchSamples, &local));
     app->db.flushIntervalMs = int(iniInt(
-        ini, QStringLiteral("database/flush_interval_ms"), 100, 5000,
+        folded, QStringLiteral("database/flush_interval_ms"), 100, 5000,
         app->db.flushIntervalMs, &local));
     app->db.queueSamples = int(iniInt(
-        ini, QStringLiteral("database/queue_samples"), 1, 500000,
+        folded, QStringLiteral("database/queue_samples"), 1, 500000,
         app->db.queueSamples, &local));
     app->db.eventQueueSize = int(iniInt(
-        ini, QStringLiteral("database/event_queue_size"), 10, 10000,
+        folded, QStringLiteral("database/event_queue_size"), 10, 10000,
         app->db.eventQueueSize, &local));
     app->db.busyTimeoutMs = int(iniInt(
-        ini, QStringLiteral("database/busy_timeout_ms"), 100, 1000,
+        folded, QStringLiteral("database/busy_timeout_ms"), 100, 1000,
         app->db.busyTimeoutMs, &local));
     app->db.shutdownFlushMs = int(iniInt(
-        ini, QStringLiteral("database/shutdown_flush_ms"), 1000, 10000,
+        folded, QStringLiteral("database/shutdown_flush_ms"), 1000, 10000,
         app->db.shutdownFlushMs, &local));
 
     // [logging]
-    if (ini.contains(QStringLiteral("logging/level"))) {
-        const QString raw = ini.value(QStringLiteral("logging/level")).toString().trimmed();
+    if (folded.contains(QStringLiteral("logging/level"))) {
+        const QString raw = folded.value(QStringLiteral("logging/level")).trimmed();
         const auto level = parseLogLevel(raw);
         if (level)
             app->logging.level = *level;
@@ -614,8 +622,8 @@ void parseAppIni(const QString &iniPath, AppConfig *app, Issues *issues)
             local.add(QStringLiteral("logging/level"),
                       QStringLiteral("应为 DEBUG/INFO/WARN/ERROR,实际 \"%1\"").arg(raw));
     }
-    if (ini.contains(QStringLiteral("logging/raw_frames"))) {
-        const QString raw = ini.value(QStringLiteral("logging/raw_frames")).toString().trimmed();
+    if (folded.contains(QStringLiteral("logging/raw_frames"))) {
+        const QString raw = folded.value(QStringLiteral("logging/raw_frames")).trimmed();
         if (raw == QStringLiteral("true"))
             app->logging.rawFrames = true;
         else if (raw == QStringLiteral("false"))
@@ -625,10 +633,10 @@ void parseAppIni(const QString &iniPath, AppConfig *app, Issues *issues)
                       QStringLiteral("应为 true/false,实际 \"%1\"").arg(raw));
     }
     app->logging.maxFileBytes = iniInt(
-        ini, QStringLiteral("logging/max_file_bytes"), 1024 * 1024, 100 * 1024 * 1024,
+        folded, QStringLiteral("logging/max_file_bytes"), 1024 * 1024, 100 * 1024 * 1024,
         app->logging.maxFileBytes, &local);
     app->logging.maxFiles = int(iniInt(
-        ini, QStringLiteral("logging/max_files"), 1, 20, app->logging.maxFiles, &local));
+        folded, QStringLiteral("logging/max_files"), 1, 20, app->logging.maxFiles, &local));
 
     if (local.empty()) {
         const int hb = app->heartbeatIntervalMs;

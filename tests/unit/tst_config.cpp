@@ -649,9 +649,12 @@ void TestConfig::iniDbPathAbsolute()
 {
     QTemporaryDir runRoot;
     writeUtf8(runRoot, "config/devices.json", kValidDevices);
+    // 绝对路径必须被拒;C:/ 形态在 Linux 上反而是相对路径,须按平台取真
+    // 绝对路径(QDir::tempPath 两侧都是正斜杠,不触发 INI 反斜杠转义)
+    const QString absPath = QDir::temp().absoluteFilePath(QStringLiteral("dms-abs.db"));
     writeUtf8(runRoot, "config/app.ini",
-              QByteArray("[app]\nschema_version=1\n\n"
-                         "[database]\npath=C:/data/dms.db\n"));
+              QByteArray("[app]\nschema_version=1\n\n[database]\npath=")
+                  + absPath.toUtf8() + QByteArray("\n"));
     QVERIFY(!loadConfiguration(runRoot.path(), runRoot.path()).ok);
 
     writeUtf8(runRoot, "config/app.ini",

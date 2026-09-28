@@ -64,6 +64,8 @@ COM3 仅示例；Ubuntu 填实际枚举的 /dev/tty… 路径，不假定设备�
 - UDP bind_address/peer_address 必须是合法 IP，peer 不允许通配地址；端口 1–65535；四元组 (bind_address,bind_port,peer_address,peer_port) 唯一；同一 bind 复用 socket。
 - 串口 port_name 非空；baud_rate∈{9600,19200,38400,57600,115200}，data_bits∈{7,8}，parity∈{none,even,odd}，stop_bits∈{1,2}，flow_control∈{none,hardware,software}；不支持参数须明确报错，不能悄悄改为默认值。启用设备不能重复占用同一串口。
 - alarm_rules 可为空；每个 metric_id∈1..4 且不能重复；low/high 都是有限数且 low<high；0≤hysteresis≤(high-low)/2。阈值使用协议单位。
+- app.ini 的节与键不区分大小写：该契约由装载器自行做小写折叠实现，不依赖 QSettings INI 后端（其匹配语义随 Qt 版本漂移：6.8.3 代为折叠、6.4.2 按文件原样匹配）。
+- database/path 只允许运行根下的相对路径（拒绝绝对路径、`..` 与反斜杠），数据库随运行根存放。
 - 首次无配置提示初始化，非法配置不自动覆盖；reload 失败保留当前有效快照并给出字段错误。在线编辑需先停止对应会话，不能边收流边更改协议配置。
 
 ## 4. app.ini 默认值

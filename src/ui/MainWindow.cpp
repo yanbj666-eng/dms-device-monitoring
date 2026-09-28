@@ -9,6 +9,7 @@
 #include <QSpinBox>
 #include <QSplitter>
 #include <QStatusBar>
+#include <QtEndian> // qToBigEndian:MSVC/Qt6.8 经传递包含可见,g++/Qt6.4.2 必须显式包含
 #include <QTableWidget>
 #include <QToolBar>
 #include <QTimer>
