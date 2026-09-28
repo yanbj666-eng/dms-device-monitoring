@@ -1,19 +1,22 @@
-// tst_integration:S2+S3 端到端集成测试
-// QProcess 拉起 dms_simulator 独立进程,真实 TCP 全链路:
-//   TcpTransport + DeviceSession(状态机/自动重连/命令生命周期)
-//   vs 模拟设备(遥测/心跳/命令 ACK/多设备/故障注入)
+// tst_integration:S2-S7 端到端集成测试
+// QProcess 拉起 dms_simulator 独立进程,真实全链路(TCP/UDP/串口三形态):
+//   ITransport 三实现 + DeviceSession(状态机/自动重连/命令生命周期/UDP 语义)
+//   vs 模拟设备(遥测/心跳/命令 ACK/多设备/故障注入/数据报故障)
 //
 // 时序约定:模拟器故障时钟 0 点 = 设备构造时刻,略早于 SIM READY 行;
 // 测试以 READY 到达为本地锚点,因此"设备时刻 = 本地时刻 + δ(δ≥0,实测毫秒级)".
 // 所有窗口断言取窗口中段,前后各留 200ms+ 余量吸收 δ 与调度抖动.
 #include <QtTest>
 
+#include <QDateTime>
 #include <QElapsedTimer>
 #include <QProcess>
 #include <QTcpServer>
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QTemporaryDir>
+#include <QUdpSocket>
+#include <QSerialPortInfo>
 #include <QtEndian>
 
 #include <algorithm>
@@ -28,7 +31,9 @@
 #include "persistence/Database.h"
 #include "persistence/DatabaseWorker.h"
 #include "persistence/Repository.h"
+#include "transport/SerialTransport.h"
 #include "transport/TcpTransport.h"
+#include "transport/UdpTransport.h"
 
 using dms::domain::CommandOutcome;
 using dms::domain::CommandState;
@@ -74,42 +79,81 @@ quint16 findFreePortRange(int count)
     return 0;
 }
 
-// 模拟器进程封装:等 SIM READY 同步行;停止一律强杀(测试设备进程不求优雅退出)
+// 找一个空闲 UDP 绑定端口(DMS 共享端点用);0 = 失败。
+// 关掉即让出,存在极小竞争窗——被抢时 UdpTransport bind 失败会退避重试
+quint16 findFreeUdpPort()
+{
+    QUdpSocket probe;
+    if (!probe.bind(QHostAddress::LocalHost, 0))
+        return 0;
+    const quint16 port = probe.localPort();
+    probe.close();
+    return port;
+}
+
+// 模拟器进程封装:等 SIM READY 同步行;停止一律强杀(测试设备进程不求优雅退出)。
+// 三形态:TCP 监听端口 / UDP 固定源端口单发 / Serial 独占串口名
 class SimProcess
 {
 public:
     ~SimProcess() { stop(); }
 
+    // TCP:每设备一个监听端口(既有用例)
     bool start(int count, int periodMs, const QStringList &faultArgs, quint32 seed = 7)
     {
-        // 复用同一 QProcess 对象:上一个模拟器若还活着,start() 会静默失败而
-        // waitForStarted 对 Running 状态立即返回 true,waitReady 白等 15s 超时
         stop();
         for (int attempt = 0; attempt < 3; ++attempt) {
             const quint16 base = findFreePortRange(count);
             if (base == 0)
                 return false;
-            QStringList args{
-                QStringLiteral("-c"), QString::number(count),
-                QStringLiteral("-p"), QString::number(base),
-                QStringLiteral("-s"), QString::number(periodMs),
-                QStringLiteral("-d"), QString::number(seed),
-                // stderr 管道无人消费:压到 ERROR,防日志写满管道卡死模拟器
-                QStringLiteral("--log-level"), QStringLiteral("ERROR"),
-            };
-            args << faultArgs;
-            process_.setProgram(QStringLiteral(DMS_SIMULATOR_PATH));
-            process_.setArguments(args);
-            process_.start();
-            if (!process_.waitForStarted(5000))
-                continue;
-            if (waitReady(count, base, 15000)) {
+            QStringList args = baseArgs(periodMs, seed);
+            args << QStringLiteral("-c") << QString::number(count)
+                 << QStringLiteral("-p") << QString::number(base)
+                 << faultArgs;
+            if (launchWaitReady(args, portEndpoints(count, base))) {
                 basePort_ = base;
                 return true;
             }
             stop(); // 端口被抢等启动失败:换端口段重试
         }
         return false;
+    }
+
+    // UDP:设备固定源端口 base..base+count-1(设备身份),单发 DMS 绑定端点
+    bool startUdp(int count, int periodMs, quint16 dmsBindPort,
+                  const QStringList &faultArgs, quint32 seed = 7)
+    {
+        stop();
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            const quint16 base = findFreePortRange(count);
+            if (base == 0)
+                return false;
+            QStringList args = baseArgs(periodMs, seed);
+            args << QStringLiteral("--transport") << QStringLiteral("udp")
+                 << QStringLiteral("-c") << QString::number(count)
+                 << QStringLiteral("-p") << QString::number(base)
+                 << QStringLiteral("--peer")
+                 << QStringLiteral("127.0.0.1:%1").arg(dmsBindPort)
+                 << faultArgs;
+            if (launchWaitReady(args, portEndpoints(count, base))) {
+                basePort_ = base;
+                return true;
+            }
+            stop();
+        }
+        return false;
+    }
+
+    // Serial:端口名即端点,无端口段可换(重试无意义);模拟器占传入的一端
+    bool startSerial(const QStringList &portNames, int periodMs,
+                     const QStringList &faultArgs, quint32 seed = 7)
+    {
+        stop();
+        QStringList args = baseArgs(periodMs, seed);
+        args << QStringLiteral("--transport") << QStringLiteral("serial")
+             << QStringLiteral("--serial-ports") << portNames.join(QLatin1Char(','))
+             << faultArgs;
+        return launchWaitReady(args, portNames);
     }
 
     quint16 portAt(int index) const { return quint16(basePort_ + index); }
@@ -123,9 +167,39 @@ public:
     }
 
 private:
-    // 读 stdout 直到 "SIM READY p0..pn" 行,并核对端口与请求一致
-    bool waitReady(int count, quint16 expectedBase, int timeoutMs)
+    static QStringList baseArgs(int periodMs, quint32 seed)
     {
+        return {QStringLiteral("-s"), QString::number(periodMs),
+                QStringLiteral("-d"), QString::number(seed),
+                // stderr 管道无人消费:压到 ERROR,防日志写满管道卡死模拟器
+                QStringLiteral("--log-level"), QStringLiteral("ERROR")};
+    }
+
+    static QStringList portEndpoints(int count, quint16 base)
+    {
+        QStringList endpoints;
+        for (int i = 0; i < count; ++i)
+            endpoints << QString::number(base + i);
+        return endpoints;
+    }
+
+    // 复用同一 QProcess 对象:上一个模拟器若还活着,start() 会静默失败而
+    // waitForStarted 对 Running 状态立即返回 true,waitReady 白等 15s 超时
+    bool launchWaitReady(const QStringList &args, const QStringList &expectedEndpoints)
+    {
+        process_.setProgram(QStringLiteral(DMS_SIMULATOR_PATH));
+        process_.setArguments(args);
+        process_.start();
+        if (!process_.waitForStarted(5000))
+            return false;
+        return waitReady(expectedEndpoints, 15000);
+    }
+
+    // 读 stdout 直到 "SIM READY e0..en" 行,并核对端点与请求一致
+    // (TCP/UDP 为端口号数字,serial 为串口名;统一按字符串比对)
+    bool waitReady(const QStringList &expected, int timeoutMs)
+    {
+        const int count = expected.size();
         QElapsedTimer t;
         t.start();
         QByteArray buf;
@@ -141,19 +215,16 @@ private:
             const QList<QByteArray> parts = buf.left(nl).trimmed().split(' ');
             if (parts.size() != 2 + count || parts[0] != "SIM" || parts[1] != "READY")
                 return false;
-            for (int i = 0; i < count; ++i) {
-                bool ok = false;
-                const uint p = parts[2 + i].toUInt(&ok);
-                if (!ok || p != uint(expectedBase) + uint(i))
+            for (int i = 0; i < count; ++i)
+                if (QString::fromLatin1(parts[2 + i]) != expected.at(i))
                     return false;
-            }
             return true;
         }
         return false;
     }
 
     QProcess process_;
-    quint16 basePort_ = 0;
+    quint16 basePort_ = 0; // TCP=监听端口;UDP=源端口(serial 不用)
 };
 
 CommandParam periodParam(quint32 ms)
@@ -224,7 +295,7 @@ bool findManagerFinished(const QSignalSpy &spy, quint16 commandId)
 }
 
 // S7 起 DeviceSetup.transport 是 variant:TCP 用例统一经此构型
-// (S7 的 UDP/Serial E2E 在后续提交加入)
+// (UDP/串口 E2E 直接建 transport+session,不经 DeviceSetup)
 dms::domain::DeviceSetup tcpSetup(const QString &id, quint16 port)
 {
     dms::domain::DeviceSetup setup;
@@ -235,6 +306,26 @@ dms::domain::DeviceSetup tcpSetup(const QString &id, quint16 port)
     cfg.port = port;
     setup.transport = cfg;
     return setup;
+}
+
+// UDP 会话语义(LLD §3):失联不关绑定、Reconnecting 收帧直接恢复、禁命令
+dms::domain::SessionConfig udpSessionConfig()
+{
+    dms::domain::SessionConfig cfg;
+    cfg.transportKind = dms::transport::TransportKind::Udp;
+    return cfg;
+}
+
+// 受控"设备"报文(与模拟器同一编码路径):单指标遥测,seq 显式指定
+QByteArray fakeTelFrame(quint32 seq)
+{
+    dms::protocol::TelemetrySample s;
+    s.metricId = quint16(dms::protocol::MetricId::Temperature);
+    s.valueType = dms::protocol::kValueTypeFloat32;
+    s.asFloat = 25.0f;
+    return dms::protocol::encodeFrame(quint8(dms::protocol::MessageType::Telemetry), seq,
+                                      QDateTime::currentMSecsSinceEpoch(),
+                                      dms::protocol::MessageCodec::encodeTelemetry({s}));
 }
 
 } // namespace
@@ -267,6 +358,9 @@ private slots:
     void alarmCrcEndToEnd();
     void alarmStaleAndCommLostEndToEnd();
     void acquisitionPauseExemptsStaleAlarm();
+    void udpSharedEndpointAndSourceIsolation();
+    void udpDatagramFaultsEndToEnd();
+    void serialLinkEndToEnd();
 
 private:
     SimProcess sim_; // 每用例一个全新模拟器进程,状态隔离
@@ -1037,6 +1131,200 @@ void TestIntegration::acquisitionPauseExemptsStaleAlarm()
     QCOMPARE(countAlarms(alarmSpy, dms::domain::AlarmEvent::Kind::Triggered,
                          QStringLiteral("DATA_STALE"), id),
              0);
+}
+
+// S7 E2E 之一(TC-UDP-001):两设备共享 DMS 绑定端点,按来源四元组隔离;
+// 未知来源合法报文也整报丢弃;非"恰好一帧"整报拒绝;UDP 不承载命令
+void TestIntegration::udpSharedEndpointAndSourceIsolation()
+{
+    const quint16 dmsBind = findFreeUdpPort();
+    QVERIFY(dmsBind != 0);
+    QVERIFY(sim_.startUdp(2, 100, dmsBind, {}));
+
+    const dms::domain::SessionConfig udpCfg = udpSessionConfig();
+
+    dms::transport::UdpTransportConfig cfg1;
+    cfg1.deviceId = QStringLiteral("itest-16-a");
+    cfg1.bindAddress = QHostAddress::LocalHost;
+    cfg1.bindPort = dmsBind;
+    cfg1.peerAddress = QHostAddress::LocalHost;
+    cfg1.peerPort = sim_.portAt(0);
+    auto *t1 = new dms::transport::UdpTransport(cfg1); // 会话接管(parent-child)
+    DeviceSession s1(cfg1.deviceId, t1, udpCfg);
+
+    // 第二个 transport 同一绑定端点:UdpEndpointSocket 端点池共享 socket(协议 §7)
+    dms::transport::UdpTransportConfig cfg2 = cfg1;
+    cfg2.deviceId = QStringLiteral("itest-16-b");
+    cfg2.peerPort = sim_.portAt(1);
+    auto *t2 = new dms::transport::UdpTransport(cfg2);
+    DeviceSession s2(cfg2.deviceId, t2, udpCfg);
+
+    QSignalSpy tel1(&s1, &DeviceSession::telemetryReceived);
+    QSignalSpy tel2(&s2, &DeviceSession::telemetryReceived);
+    s1.start();
+    s2.start();
+    waitOnline(s1);
+    waitOnline(s2);
+    QTRY_VERIFY_WITH_TIMEOUT(tel1.size() >= 5, 5000);
+    QTRY_VERIFY_WITH_TIMEOUT(tel2.size() >= 5, 5000);
+    QCOMPARE(s1.badCrcFrames(), 0u);
+    QCOMPARE(s2.badCrcFrames(), 0u);
+    QCOMPARE(s1.malformedDatagrams(), 0u);
+    QCOMPARE(s2.malformedDatagrams(), 0u);
+
+    // 未知来源(stranger 端口)发合法帧:端点整报丢弃,任何会话都不交付。
+    // 断言用 staleSeq 计数而非帧数:遥测仍在流入,帧数必然增长,不可作判据;
+    // 该帧 seq=1 若被误投递必判"旧"计数,计 0 即证明从未进会话
+    QUdpSocket stranger;
+    QVERIFY(stranger.bind(QHostAddress::LocalHost, 0));
+    const quint64 dropsBefore = t1->unknownSourceDrops();
+    stranger.writeDatagram(fakeTelFrame(1), QHostAddress::LocalHost, dmsBind);
+    QTRY_COMPARE(t1->unknownSourceDrops(), dropsBefore + 1);
+    {
+        QElapsedTimer w;
+        w.start();
+        WAIT_UNTIL(w, 300);
+    }
+    QCOMPARE(s1.staleSeqFrames(), 0u);
+    QCOMPARE(s2.staleSeqFrames(), 0u);
+
+    // 非"恰好一帧"整报拒绝:受控 socket 扮演第三个已知来源设备
+    QUdpSocket fakeDev;
+    QVERIFY(fakeDev.bind(QHostAddress::LocalHost, 0));
+    dms::transport::UdpTransportConfig cfg3 = cfg1;
+    cfg3.deviceId = QStringLiteral("itest-16-fake");
+    cfg3.peerPort = fakeDev.localPort();
+    auto *t3 = new dms::transport::UdpTransport(cfg3);
+    DeviceSession s3(cfg3.deviceId, t3, udpCfg);
+    QSignalSpy tel3(&s3, &DeviceSession::telemetryReceived);
+    s3.start();
+
+    fakeDev.writeDatagram(fakeTelFrame(10), QHostAddress::LocalHost, dmsBind);
+    QTRY_VERIFY_WITH_TIMEOUT(s3.state() == SessionState::Online, 5000);
+    QCOMPARE(tel3.size(), 1);
+
+    // 两帧一报 + 半帧:均整报拒绝,不交付。UDP 路径每报独立解码
+    // (onDatagramReceived 先 reset 解码器,LLD §3"半帧绝不留到下一报"),
+    // 因此好报随后直接交付,无需冲刷残留
+    fakeDev.writeDatagram(fakeTelFrame(11) + fakeTelFrame(12),
+                          QHostAddress::LocalHost, dmsBind);
+    fakeDev.writeDatagram(fakeTelFrame(13).left(15), QHostAddress::LocalHost, dmsBind);
+    QTRY_COMPARE(s3.malformedDatagrams(), 2u);
+    QCOMPARE(tel3.size(), 1);
+
+    fakeDev.writeDatagram(fakeTelFrame(14), QHostAddress::LocalHost, dmsBind); // 好报恢复
+    QTRY_VERIFY_WITH_TIMEOUT(tel3.size() == 2, 3000);
+    QCOMPARE(s3.malformedDatagrams(), 2u);
+    QCOMPARE(s3.staleSeqFrames(), 0u);
+
+    // UDP 不承载命令(协议 §7):会话侧直接拒绝,Seq=0
+    QCOMPARE(s1.sendCommand(kCmdSetParameter, {periodParam(200)}), quint32(0));
+}
+
+// S7 E2E 之二(TC-UDP-002):数据报三故障真注入——丢包窗遥测冻结、
+// 乱序窗旧报按 seq 模差丢弃、重复窗第二份按 d=0 丢弃;窗口后全恢复
+void TestIntegration::udpDatagramFaultsEndToEnd()
+{
+    const quint16 dmsBind = findFreeUdpPort();
+    QVERIFY(dmsBind != 0);
+    QVERIFY(sim_.startUdp(1, 100, dmsBind,
+                          {QStringLiteral("-f"), QStringLiteral("datagramDrop@3000+1200"),
+                           QStringLiteral("-f"), QStringLiteral("datagramReorder@6500+1200"),
+                           QStringLiteral("-f"), QStringLiteral("datagramDuplicate@10000+1000")}));
+    QElapsedTimer clock;
+    clock.start(); // 锚点:READY 已到;设备故障钟 0 点略早(δ≥0,窗中段留足余量)
+
+    dms::transport::UdpTransportConfig cfg;
+    cfg.deviceId = QStringLiteral("itest-17");
+    cfg.bindAddress = QHostAddress::LocalHost;
+    cfg.bindPort = dmsBind;
+    cfg.peerAddress = QHostAddress::LocalHost;
+    cfg.peerPort = sim_.portAt(0);
+    auto *transport = new dms::transport::UdpTransport(cfg);
+    DeviceSession session(cfg.deviceId, transport, udpSessionConfig());
+
+    QSignalSpy telSpy(&session, &DeviceSession::telemetryReceived);
+    session.start();
+    waitOnline(session);
+    QTRY_VERIFY_WITH_TIMEOUT(telSpy.size() >= 10, 5000);
+
+    // 丢包窗 [3000,4200) 设备时刻:本地 3200-3600 必在窗内(容忍 δ<600ms),
+    // 全部数据报被丢,遥测冻结
+    WAIT_UNTIL(clock, 3200);
+    const int telAtDrop = telSpy.size();
+    QVERIFY(telAtDrop >= 10);
+    WAIT_UNTIL(clock, 3600);
+    QCOMPARE(telSpy.size(), telAtDrop);
+
+    // 窗口结束:链路照常恢复;1200ms 静默 << 4000ms 失联线,不 Reconnecting
+    QTRY_VERIFY_WITH_TIMEOUT(telSpy.size() > telAtDrop + 5, 4000);
+    QCOMPARE(session.state(), SessionState::Online);
+
+    // 乱序窗 [6500,7700):相邻对调;每对旧报(后到)按 seq 模差判旧丢弃
+    WAIT_UNTIL(clock, 6100);
+    const quint32 staleAtReorder = session.staleSeqFrames();
+    const int telAtReorder = telSpy.size();
+    WAIT_UNTIL(clock, 7900);
+    QVERIFY(session.staleSeqFrames() >= staleAtReorder + 2); // 窗内 ~6 次对调
+    QVERIFY(telSpy.size() > telAtReorder);                   // 每对新报照常交付
+    QCOMPARE(session.state(), SessionState::Online);
+
+    // 重复窗 [10000,11000):同报连发两次,第二份 d=0 判重复丢弃
+    WAIT_UNTIL(clock, 9500);
+    const quint32 staleAtDup = session.staleSeqFrames();
+    WAIT_UNTIL(clock, 11200);
+    QVERIFY(session.staleSeqFrames() >= staleAtDup + 2); // 窗内 ~10 份重复
+    QCOMPARE(session.state(), SessionState::Online);
+    QVERIFY(telSpy.size() > telAtReorder + 10); // 实时值无回退,持续推进
+}
+
+// S7 E2E 之三(TC-SERIAL-001):虚拟串口对上真实 QSerialPort 全链路——
+// 遥测上线 + 命令/ACK 回走同一串口对。无虚拟对的环境按条件跳过(Blocked)
+void TestIntegration::serialLinkEndToEnd()
+{
+    // Windows: com0com 装出 COM3<->COM5;WSL2: socat 建 pty 对
+    const QString pair = qEnvironmentVariable("DMS_TEST_SERIAL_PAIR");
+    if (pair.isEmpty())
+        QSKIP("需要虚拟串口对:Windows 用 com0com,WSL2 用 socat。设置 "
+              "DMS_TEST_SERIAL_PAIR=\"COM3,COM5\"(模拟器占第一端,DMS 占第二端)后启用");
+    const QStringList names = pair.split(QLatin1Char(','));
+    if (names.size() != 2 || names.at(0).trimmed().isEmpty() || names.at(1).trimmed().isEmpty())
+        QSKIP("DMS_TEST_SERIAL_PAIR 需要形如 COM3,COM5 的两个逗号分隔端口名");
+    const QString simPort = names.at(0).trimmed();
+    const QString dmsPort = names.at(1).trimmed();
+
+    bool dmsPortPresent = false;
+    for (const QSerialPortInfo &info : QSerialPortInfo::availablePorts())
+        if (info.portName().compare(dmsPort, Qt::CaseInsensitive) == 0)
+            dmsPortPresent = true;
+    if (!dmsPortPresent)
+        QSKIP(QStringLiteral("DMS 侧端口 %1 不存在,请核对 com0com/socat 配置")
+                  .arg(dmsPort)
+                  .toUtf8()
+                  .constData());
+
+    QVERIFY(sim_.startSerial({simPort}, 100, {}));
+
+    dms::domain::SessionConfig serialCfg;
+    serialCfg.transportKind = dms::transport::TransportKind::Serial;
+    dms::transport::SerialTransportConfig cfg;
+    cfg.deviceId = QStringLiteral("itest-18");
+    cfg.portName = dmsPort;
+    auto *transport = new dms::transport::SerialTransport(cfg);
+    DeviceSession session(cfg.deviceId, transport, serialCfg);
+
+    QSignalSpy telSpy(&session, &DeviceSession::telemetryReceived);
+    QSignalSpy finishedSpy(&session, &DeviceSession::commandFinished);
+    session.start();
+    waitOnline(session);
+    QTRY_VERIFY_WITH_TIMEOUT(telSpy.size() >= 5, 5000);
+
+    // 命令全链路:命令字节写进 DMS 端口,ACK 从设备端绕回同一对
+    const quint32 seq = session.sendCommand(kCmdSetParameter, {periodParam(300)});
+    QVERIFY(seq != 0);
+    CommandOutcome out;
+    QTRY_VERIFY_WITH_TIMEOUT(findFinished(finishedSpy, seq, out), 3000);
+    QCOMPARE(out.state, CommandState::Succeeded);
 }
 
 QTEST_MAIN(TestIntegration)
