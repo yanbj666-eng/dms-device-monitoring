@@ -132,21 +132,26 @@ max_files=5
 
 ## 5. 模拟器配置与故障注入
 
-`dms_simulator`（S2 已实现）CLI 参数：
+`dms_simulator`（S2 TCP；S7 增 UDP/串口形态）CLI 参数：
 
 | 参数 | 含义 | 接受范围/默认 |
 |---|---|---|
-| `-c, --count <n>` | 模拟设备数，每设备独立监听端口 | 1–100，默认 10 |
-| `-p, --port <port>` | 起始 TCP 监听端口，端口段不得越界 | 1–65535，默认 9001 |
+| `-t, --transport <kind>` | 传输形态：tcp（监听端口单客户端）、udp（固定源端口单发遥测/心跳，不收命令）、serial（独占串口，命令集同 TCP） | tcp/udp/serial，默认 tcp |
+| `-c, --count <n>` | 模拟设备数（tcp/udp：每设备一个端口；serial：由 `--serial-ports` 个数决定，显式 `-c` 与之不符会报错） | 1–100，默认 10 |
+| `-p, --port <port>` | 起始端口：TCP 监听端口 / UDP 固定源端口（设备身份，DMS 按来源四元组区分设备），端口段不得越界 | 1–65535，默认 9001 |
+| `--peer <host:port>` | UDP 单发目标（DMS 绑定端点），全部设备发往同一端点 | 仅 udp 必填 |
+| `--serial-ports <list>` | 串口名逗号列表，如 `COM3,COM5`；固定 115200/8N1 无流控（与 DMS 串口默认一致） | 仅 serial 必填 |
 | `-s, --period <ms>` | 遥测采样周期 | 100–1000，默认 100 |
 | `-d, --seed <n>` | 随机种子；每设备实际种子 = seed + index×1000003，数据与注入序列可复现 | uint32，默认 42 |
-| `-f, --fault <spec>` | 故障注入，可重复；`mode@startMs+durationMs`，时间相对进程启动 | mode 见下 |
+| `-f, --fault <spec>` | 故障注入，可重复；`mode@startMs+durationMs`，时间相对进程启动 | mode 见下，按形态过滤 |
 | `-r, --run-seconds <s>` | 运行秒数，0=直到手动停止 | 0–86400，默认 0 |
 | `-l, --log-dir <dir>` | 日志目录；缺省只输出 stderr | 合法目录 |
 | `--log-level <level>` | 日志级别 | DEBUG/INFO/WARN/ERROR，默认 INFO |
 
-非法参数明确报错退出（stderr + CONFIG_INVALID 日志），不悄悄改用默认值。全部端口就绪后向 stdout 输出一行 `SIM READY p0 p1 …` 作为集成测试同步点；每 10s 记录累计发送帧/样本数，退出时汇总。`-v/--version` 被 Qt 保留，`--log-level` 为长选项。
+非法参数明确报错退出（stderr + CONFIG_INVALID 日志），不悄悄改用默认值；`--peer`/`--serial-ports` 用在不匹配的形态上同样报错。全部端点就绪后向 stdout 输出一行 `SIM READY e0 e1 …`（TCP/UDP 为端口号，serial 为串口名）作为集成测试同步点；每 10s 记录累计发送帧/样本数，退出时汇总。`-v/--version` 被 Qt 保留，`--log-level` 为长选项。
 
-标准 TCP 负载：10 个独立端点 127.0.0.1:9001–9010，每 100ms 一帧、四指标，心跳 1000ms。S7 增加 UDP 来源固定端口和虚拟串口对。
+标准 TCP 负载：10 个独立端点 127.0.0.1:9001–9010，每 100ms 一帧、四指标，心跳 1000ms。UDP 形态：每设备固定源端口（默认 9301 起），一报一帧发往 DMS 共享绑定端点。serial 形态需要虚拟串口对（Windows 用 com0com，如 COM3↔COM5；WSL2 用 socat），设备开一端，DMS 配另一端。
 
-故障模式（`--fault` 的 mode）：`badCrc`（坏 CRC，帧尾字节翻转）、`abnormalValue`（遥测超常值，喂告警引擎）、`stopSending`（遥测+心跳全静默）、`disconnect`（开窗即刻拆链，窗口内新连接接受即拆）、`ackDelay`（ACK 延迟 500ms）、`ackNoReply`（不回 ACK）、`fragment`（每帧拆两段、间隔 15ms，多帧并发时整帧排队保序）、`merge`（相邻两帧并一次写，孤帧 300ms 兜底）。UDP 才注入数据报丢弃/乱序/重复；TCP 跳过一条应用帧不能称为 TCP 网络丢包。
+故障模式（`--fault` 的 mode）：`badCrc`（坏 CRC，帧尾字节翻转）、`abnormalValue`（遥测超常值，喂告警引擎）、`stopSending`（遥测+心跳全静默）、`disconnect`（开窗即刻拆链；TCP 窗口内新连接接受即拆，serial 关端口、窗口结束重开）、`ackDelay`（ACK 延迟 500ms）、`ackNoReply`（不回 ACK）、`fragment`（每帧拆两段、间隔 15ms，多帧并发时整帧排队保序）、`merge`（相邻两帧并一次写，孤帧 300ms 兜底）、`datagramDrop`（UDP 整报丢弃，真网络丢包）、`datagramReorder`（UDP 相邻报对调，接收端 seq 模差应判旧丢弃）、`datagramDuplicate`（UDP 同报连发两次，seq 重复应丢弃）。
+
+故障与形态的组合在启动期校验：数据报三故障仅 udp——TCP 跳一条应用帧不能称为 TCP 网络丢包，字节流也无"报文"可乱序/重复；`fragment`/`merge` 仅 tcp/serial（UDP 报文边界天然保留，无半包/粘包）；`disconnect`/`ackDelay`/`ackNoReply` 仅 tcp/serial（UDP 无连接、不收命令）。`badCrc`/`abnormalValue`/`stopSending` 三形态皆可。

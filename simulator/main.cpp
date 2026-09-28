@@ -1,9 +1,11 @@
-// dms_simulator:TCP 设备模拟器 CLI(S2,docs/15 §5)
+// dms_simulator:设备模拟器 CLI(S2 TCP;S7 增 UDP/串口形态,docs/15 §5)
 // 全部设备共享本进程唯一事件循环;固定种子决定数据序列
 #include <QCommandLineParser>
 #include <QCoreApplication>
+#include <QHostAddress>
 #include <QList>
 #include <QString>
+#include <QStringList>
 #include <QTimer>
 
 #include <cstdio>
@@ -34,6 +36,28 @@ void usageError(const QString &message)
     dms::logMessage(dms::LogLevel::Error, dms::LogCategory::App, ctx, message);
 }
 
+// 故障与传输形态的合法组合(docs/15 §5):
+//   数据报三故障仅 UDP——TCP/串口跳一条应用帧不是"网络丢包";
+//   fragment/merge 仅字节流——UDP 报文边界天然保留,无半包/粘包;
+//   disconnect/ackDelay/ackNoReply 仅有命令路径的形态——UDP 不收命令、无连接
+bool faultAllowedOnTransport(dms::sim::FaultMode mode, dms::sim::SimTransport transport)
+{
+    using dms::sim::FaultMode;
+    using dms::sim::SimTransport;
+    const bool udpOnly = mode == FaultMode::DatagramDrop || mode == FaultMode::DatagramReorder
+                         || mode == FaultMode::DatagramDuplicate;
+    if (udpOnly)
+        return transport == SimTransport::Udp;
+    const bool streamOnly = mode == FaultMode::Fragment || mode == FaultMode::Merge;
+    if (streamOnly)
+        return transport != SimTransport::Udp;
+    const bool commandOnly =
+        mode == FaultMode::Disconnect || mode == FaultMode::AckDelay || mode == FaultMode::AckNoReply;
+    if (commandOnly)
+        return transport != SimTransport::Udp;
+    return true; // badCrc/abnormalValue/stopSending:三形态皆可
+}
+
 } // namespace
 
 int main(int argc, char *argv[])
@@ -44,7 +68,7 @@ int main(int argc, char *argv[])
 
     QCommandLineParser parser;
     parser.setApplicationDescription(QStringLiteral(
-        "DMS TCP 设备模拟器(协议 v1):每设备一个监听端口,四指标遥测+心跳+命令/ACK,"
+        "DMS 设备模拟器(协议 v1):TCP/UDP/串口三形态,四指标遥测+心跳+命令/ACK(TCP/串口),"
         "支持可复现故障注入"));
     parser.addHelpOption();
     parser.addVersionOption();
@@ -52,13 +76,20 @@ int main(int argc, char *argv[])
     // 会让 addOptions 静默失败,整组选项消失——必须在启动期暴露
     const bool optionsRegistered = parser.addOptions({
         {{"c", "count"},
-         QStringLiteral("模拟设备数(各占一个端口)"),
+         QStringLiteral("模拟设备数(TCP/UDP:各占一个端口;serial:由 --serial-ports 个数决定)"),
          QStringLiteral("n"),
          QStringLiteral("10")},
+        {{"t", "transport"},
+         QStringLiteral("传输形态 tcp|udp|serial"),
+         QStringLiteral("kind"),
+         QStringLiteral("tcp")},
         {{"p", "port"},
-         QStringLiteral("起始 TCP 监听端口"),
+         QStringLiteral("起始端口(TCP 监听 / UDP 固定源端口)"),
          QStringLiteral("port"),
          QStringLiteral("9001")},
+        {QStringLiteral("peer"),
+         QStringLiteral("UDP 单发目标(DMS 绑定端点)host:port;udp 必填"),
+         QStringLiteral("host:port")},
         {{"s", "period"},
          QStringLiteral("遥测采样周期 ms(100-1000)"),
          QStringLiteral("ms"),
@@ -70,8 +101,11 @@ int main(int argc, char *argv[])
         {{"f", "fault"},
          QStringLiteral("故障注入 mode@startMs+durationMs(可重复)。mode: badCrc|"
                         "abnormalValue|stopSending|disconnect|ackDelay|ackNoReply|"
-                        "fragment|merge"),
+                        "fragment|merge|datagramDrop|datagramReorder|datagramDuplicate"),
          QStringLiteral("spec")},
+        {QStringLiteral("serial-ports"),
+         QStringLiteral("串口名逗号列表(serial 必填,如 COM3,COM5)"),
+         QStringLiteral("list")},
         {{"r", "run-seconds"},
          QStringLiteral("运行秒数,0 表示直到手动停止"),
          QStringLiteral("s"),
@@ -104,12 +138,82 @@ int main(int argc, char *argv[])
     }
     // 无 --log-dir:不初始化,全局日志自动降级 stderr
 
+    // ---- 传输形态 ----
+    dms::sim::SimTransport transport = dms::sim::SimTransport::Tcp;
+    {
+        const QString t = parser.value(QStringLiteral("transport")).toLower();
+        if (t == QStringLiteral("tcp")) transport = dms::sim::SimTransport::Tcp;
+        else if (t == QStringLiteral("udp")) transport = dms::sim::SimTransport::Udp;
+        else if (t == QStringLiteral("serial")) transport = dms::sim::SimTransport::Serial;
+        else {
+            usageError(QStringLiteral("--transport must be tcp|udp|serial"));
+            return 1;
+        }
+    }
+
+    // ---- UDP 单发目标(DMS 绑定端点)----
+    QHostAddress peerAddress;
+    quint16 peerPort = 0;
+    {
+        const QString peerText = parser.value(QStringLiteral("peer"));
+        if (transport == dms::sim::SimTransport::Udp) {
+            const qsizetype colon = peerText.indexOf(QLatin1Char(':'));
+            if (colon <= 0 || peerText.indexOf(QLatin1Char(':'), colon + 1) >= 0
+                || peerText.isEmpty()) {
+                usageError(QStringLiteral("--peer is required for udp (expect host:port)"));
+                return 1;
+            }
+            peerAddress = QHostAddress(peerText.left(colon));
+            bool okPort = false;
+            const quint16 parsed = peerText.mid(colon + 1).toUShort(&okPort);
+            if (peerAddress.isNull() || !okPort || parsed == 0) {
+                usageError(QStringLiteral("invalid --peer '%1' (expect host:port)").arg(peerText));
+                return 1;
+            }
+            peerPort = parsed;
+        } else if (parser.isSet(QStringLiteral("peer"))) {
+            usageError(QStringLiteral("--peer only applies to --transport udp"));
+            return 1;
+        }
+    }
+
+    // ---- 串口名列表 ----
+    QStringList serialPorts;
+    if (transport == dms::sim::SimTransport::Serial) {
+        const QString list = parser.value(QStringLiteral("serial-ports"));
+        if (list.isEmpty()) {
+            usageError(QStringLiteral("--serial-ports is required for --transport serial"));
+            return 1;
+        }
+        for (QString &name : list.split(QLatin1Char(','))) {
+            const QString trimmed = name.trimmed();
+            if (trimmed.isEmpty()) {
+                usageError(QStringLiteral("--serial-ports contains an empty name"));
+                return 1;
+            }
+            serialPorts.append(trimmed);
+        }
+    } else if (parser.isSet(QStringLiteral("serial-ports"))) {
+        usageError(QStringLiteral("--serial-ports only applies to --transport serial"));
+        return 1;
+    }
+
     // ---- 参数校验(非法值明确报错退出,不悄悄改默认值)----
     bool ok = false;
-    const int count = parser.value(QStringLiteral("count")).toInt(&ok);
+    int count = parser.value(QStringLiteral("count")).toInt(&ok);
     if (!ok || count < 1 || count > 100) {
         usageError(QStringLiteral("--count must be 1-100"));
         return 1;
+    }
+    if (transport == dms::sim::SimTransport::Serial) {
+        // serial 设备数 = 串口名个数;显式 --count 与之不符是配置笔误,报错
+        if (parser.isSet(QStringLiteral("count")) && count != serialPorts.size()) {
+            usageError(QStringLiteral("--count (%1) != --serial-ports entries (%2)")
+                           .arg(count)
+                           .arg(serialPorts.size()));
+            return 1;
+        }
+        count = serialPorts.size();
     }
     const int basePort = parser.value(QStringLiteral("port")).toInt(&ok);
     if (!ok || basePort < 1 || basePort > 65535 || basePort + count - 1 > 65535) {
@@ -140,42 +244,59 @@ int main(int argc, char *argv[])
                            .arg(spec));
             return 1;
         }
+        if (!faultAllowedOnTransport(f.mode, transport)) {
+            usageError(QStringLiteral("fault %1 not supported on transport %2 (docs/15 §5)")
+                           .arg(dms::sim::faultModeName(f.mode),
+                                parser.value(QStringLiteral("transport")).toLower()));
+            return 1;
+        }
         faults.append(f);
     }
 
-    // ---- 建设备:监听失败立即退出(CONFIG_INVALID)----
+    // ---- 建设备:监听/绑定/打开失败立即退出(CONFIG_INVALID)----
     QList<dms::sim::DeviceSimulator *> devices;
     for (int i = 0; i < count; ++i) {
         dms::sim::DeviceSimulator::Params p;
         p.index = i;
-        p.listenPort = quint16(basePort + i);
+        p.transport = transport;
         p.samplePeriodMs = period;
         p.seed = seed;
         p.faults = faults;
+        if (transport == dms::sim::SimTransport::Serial) {
+            p.serialPortName = serialPorts.at(i);
+        } else {
+            p.listenPort = quint16(basePort + i);
+            p.peerAddress = peerAddress;
+            p.peerPort = peerPort;
+        }
         auto *device = new dms::sim::DeviceSimulator(p, &app);
         QString err;
         if (!device->startListening(&err)) {
-            usageError(QStringLiteral("cannot listen on 127.0.0.1:%1: %2")
-                           .arg(p.listenPort)
-                           .arg(err));
+            usageError(QStringLiteral("cannot start %1 endpoint %2: %3")
+                           .arg(parser.value(QStringLiteral("transport")).toLower(),
+                                device->endpointDesc(), err));
             return 1;
         }
         devices.append(device);
     }
 
     dms::logMessage(dms::LogLevel::Info, dms::LogCategory::App, {},
-                    QStringLiteral("simulator started: devices=%1 basePort=%2 period=%3ms "
-                                   "seed=%4 faults=%5")
+                    QStringLiteral("simulator started: transport=%1 devices=%2 basePort=%3 "
+                                   "period=%4ms seed=%5 faults=%6")
+                        .arg(parser.value(QStringLiteral("transport")).toLower())
                         .arg(count)
-                        .arg(basePort)
+                        .arg(transport == dms::sim::SimTransport::Serial
+                                 ? QStringLiteral("n/a")
+                                 : QString::number(basePort))
                         .arg(period)
                         .arg(seed)
                         .arg(faults.size()));
 
-    // 集成测试的同步点:所有端口就绪后输出一行(stdout,不走日志)
+    // 集成测试的同步点:所有端点就绪后输出一行(stdout,不走日志)。
+    // TCP/UDP 是端口号,serial 是串口名(tst_integration 按形态解析)
     printf("SIM READY");
     for (const auto *d : devices)
-        printf(" %u", unsigned(d->port()));
+        printf(" %s", qPrintable(d->endpointDesc()));
     printf("\n");
     fflush(stdout);
 

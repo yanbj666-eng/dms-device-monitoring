@@ -1,6 +1,7 @@
 #include "DeviceSimulator.h"
 
 #include <QDateTime>
+#include <QNetworkDatagram>
 #include <QtEndian>
 
 #include <algorithm>
@@ -59,16 +60,78 @@ DeviceSimulator::DeviceSimulator(Params params, QObject *parent)
 
 bool DeviceSimulator::startListening(QString *errorOut)
 {
-    if (server_.isListening())
+    switch (params_.transport) {
+    case SimTransport::Tcp: {
+        if (server_.isListening())
+            return true;
+        if (!server_.listen(QHostAddress::LocalHost, params_.listenPort)) {
+            if (errorOut)
+                *errorOut = server_.errorString();
+            return false;
+        }
+        dms::logMessage(dms::LogLevel::Info, dms::LogCategory::Net, logCtx(),
+                        QStringLiteral("listening on 127.0.0.1:%1").arg(params_.listenPort));
         return true;
-    if (!server_.listen(QHostAddress::LocalHost, params_.listenPort)) {
-        if (errorOut)
-            *errorOut = server_.errorString();
-        return false;
     }
-    dms::logMessage(dms::LogLevel::Info, dms::LogCategory::Net, logCtx(),
-                    QStringLiteral("listening on 127.0.0.1:%1").arg(params_.listenPort));
-    return true;
+    case SimTransport::Udp: {
+        if (udp_)
+            return true;
+        udp_ = new QUdpSocket(this);
+        // 固定源端口 = 设备身份(协议 §7):DMS 按来源四元组区分设备,
+        // 源口漂移会被当成未知来源整报丢弃
+        if (!udp_->bind(QHostAddress::LocalHost, params_.listenPort)) {
+            if (errorOut)
+                *errorOut = udp_->errorString();
+            udp_->deleteLater();
+            udp_ = nullptr;
+            return false;
+        }
+        connect(udp_, &QUdpSocket::readyRead, this, &DeviceSimulator::onUdpReadyRead);
+        dms::logMessage(dms::LogLevel::Info, dms::LogCategory::Net, logCtx(),
+                        QStringLiteral("udp source port %1 -> %2:%3")
+                            .arg(params_.listenPort)
+                            .arg(params_.peerAddress.toString())
+                            .arg(params_.peerPort));
+        return true;
+    }
+    case SimTransport::Serial: {
+        if (serial_ && serial_->isOpen())
+            return true;
+        if (!serial_) {
+            serial_ = new QSerialPort(this);
+            // 信号只连一次:disconnect 故障窗口结束的重开不重复连接
+            connect(serial_, &QSerialPort::readyRead, this,
+                    &DeviceSimulator::onSerialReadyRead);
+            connect(serial_, &QSerialPort::errorOccurred, this,
+                    [this](QSerialPort::SerialPortError error) {
+                        // 拔出等运行期错误靠日志留痕;恢复路径由 disconnect 故障/重开覆盖
+                        if (error != QSerialPort::NoError)
+                            dms::logMessage(dms::LogLevel::Error, dms::LogCategory::Net,
+                                            logCtx(dms::ErrorCode::ConnectionLost),
+                                            QStringLiteral("serial error 0x%1: %2")
+                                                .arg(int(error), 0, 16)
+                                                .arg(serial_->errorString()));
+                    });
+        }
+        serial_->setPortName(params_.serialPortName);
+        // 与 DMS SerialTransportConfig 默认一致(115200 8N1 无流控):
+        // 虚拟串口对两端参数必须相同
+        serial_->setBaudRate(115200);
+        serial_->setDataBits(QSerialPort::Data8);
+        serial_->setParity(QSerialPort::NoParity);
+        serial_->setStopBits(QSerialPort::OneStop);
+        serial_->setFlowControl(QSerialPort::NoFlowControl);
+        if (!serial_->open(QIODevice::ReadWrite)) {
+            if (errorOut)
+                *errorOut = serial_->errorString();
+            return false;
+        }
+        dms::logMessage(dms::LogLevel::Info, dms::LogCategory::Net, logCtx(),
+                        QStringLiteral("serial port %1 open").arg(params_.serialPortName));
+        return true;
+    }
+    }
+    return false;
 }
 
 void DeviceSimulator::onNewConnection()
@@ -117,7 +180,32 @@ void DeviceSimulator::onClientReadyRead()
 {
     if (!client_)
         return;
-    const FrameDecoder::Result r = decoder_.decode(client_->readAll());
+    processIncomingBytes(client_->readAll());
+}
+
+void DeviceSimulator::onSerialReadyRead()
+{
+    if (!serial_)
+        return;
+    processIncomingBytes(serial_->readAll());
+}
+
+void DeviceSimulator::onUdpReadyRead()
+{
+    // 协议 §7:UDP 只承载设备->DMS 单向遥测/心跳,不收命令。
+    // 排空待读数据报即可——留着不读只会让 readyRead 反复触发
+    while (udp_->hasPendingDatagrams()) {
+        const QByteArray dgram = udp_->receiveDatagram().data();
+        if (!dgram.isEmpty())
+            dms::logMessage(dms::LogLevel::Debug, dms::LogCategory::Protocol, logCtx(),
+                            QStringLiteral("udp datagram ignored (%1 byte(s), no commands on udp)")
+                                .arg(dgram.size()));
+    }
+}
+
+void DeviceSimulator::processIncomingBytes(const QByteArray &bytes)
+{
+    const FrameDecoder::Result r = decoder_.decode(bytes);
 
     if (r.rxOverflow)
         dms::logMessage(dms::LogLevel::Error, dms::LogCategory::Protocol,
@@ -202,12 +290,12 @@ void DeviceSimulator::onHeartbeatTick()
 
 void DeviceSimulator::onFaultWatchTick()
 {
-    quint8 mask = 0;
-    for (int m = 0; m < 8; ++m)
+    quint16 mask = 0; // 11 种模式,quint8 放不下
+    for (int m = 0; m < kFaultModeCount; ++m)
         if (faultActive(FaultMode(m)))
-            mask |= quint8(1 << m);
+            mask |= quint16(quint16(1) << m);
 
-    for (int m = 0; m < 8; ++m) {
+    for (int m = 0; m < kFaultModeCount; ++m) {
         const bool nowActive = (mask & (1u << m)) != 0;
         const bool wasActive = (lastFaultMask_ & (1u << m)) != 0;
         if (nowActive == wasActive)
@@ -217,8 +305,35 @@ void DeviceSimulator::onFaultWatchTick()
                             .arg(dms::sim::faultModeName(FaultMode(m)),
                                  nowActive ? QStringLiteral("active")
                                            : QStringLiteral("inactive")));
-        if (nowActive && FaultMode(m) == FaultMode::Disconnect && client_)
-            closeClient(); // 主动断开:窗口开启即刻拆链(docs/15 §5)
+        if (nowActive) {
+            // 窗口开启即刻拆链(docs/15 §5);UDP 无连接可拆,该模式已被 CLI 拒绝
+            if (FaultMode(m) == FaultMode::Disconnect) {
+                if (client_)
+                    closeClient();
+                if (serial_ && serial_->isOpen())
+                    closeSerial();
+            }
+            continue;
+        }
+        // ---- 窗口结束的收尾 ----
+        if (FaultMode(m) == FaultMode::Disconnect
+            && params_.transport == SimTransport::Serial) {
+            // 串口重新打开,会话侧退避重连即恢复(TC-SERIAL-001)
+            QString err;
+            if (reopenSerial(&err))
+                dms::logMessage(dms::LogLevel::Info, dms::LogCategory::Net, logCtx(),
+                                QStringLiteral("serial port %1 reopened")
+                                    .arg(params_.serialPortName));
+            else
+                dms::logMessage(dms::LogLevel::Warn, dms::LogCategory::Net,
+                                logCtx(dms::ErrorCode::ConnectionLost),
+                                QStringLiteral("serial reopen failed: %1").arg(err));
+        }
+        if (FaultMode(m) == FaultMode::DatagramReorder && !reorderHold_.isEmpty()) {
+            // 窗口结束:被扣住未对调的报文补发,不静默丢失
+            sendDatagram(reorderHold_);
+            reorderHold_.clear();
+        }
     }
     lastFaultMask_ = mask;
 }
@@ -319,7 +434,7 @@ void DeviceSimulator::sendAck(quint32 echoSeq, quint16 commandId, AckStatus stat
 
 void DeviceSimulator::sendAckNow(quint32 echoSeq, quint16 commandId, AckStatus status)
 {
-    if (!hasClient())
+    if (!hasPeer())
         return;
     // ACK 的帧头 Seq 回显命令 Seq,不占用设备发送序号(协议 §4.3)
     deliverFrame(dms::protocol::encodeFrame(quint8(MessageType::CommandAck), echoSeq,
@@ -331,9 +446,40 @@ void DeviceSimulator::sendAckNow(quint32 echoSeq, quint16 commandId, AckStatus s
 
 void DeviceSimulator::deliverFrame(const QByteArray &frame, bool isAck)
 {
-    if (!hasClient())
-        return; // 无连接:设备不缓存离线数据,帧丢弃
+    if (!hasPeer())
+        return; // 无对端:设备不缓存离线数据,帧丢弃
 
+    if (params_.transport == SimTransport::Udp) {
+        // UDP 报文级故障(REQ-SIM-002):报文是交付单位,不存在半包/粘包
+        if (!isAck) {
+            if (faultActive(FaultMode::DatagramDrop))
+                return; // 整报丢弃:真网络丢包(流式跳帧不配叫丢包,docs/15 §5)
+            if (faultActive(FaultMode::DatagramReorder)) {
+                // 相邻对调:扣住本报,下一报先发再补发本报;接收端对旧报按
+                // seq 模差判"旧"丢弃(REQ-UDP-001),只放行先到的新报
+                if (reorderHold_.isEmpty()) {
+                    reorderHold_ = frame;
+                    return;
+                }
+                sendDatagram(frame);
+                sendDatagram(reorderHold_);
+                reorderHold_.clear();
+                return;
+            }
+            if (faultActive(FaultMode::DatagramDuplicate)) {
+                sendDatagram(frame); // 同报连发两次:seq 重复应被丢弃
+                sendDatagram(frame);
+                return;
+            }
+        }
+        QByteArray out = frame;
+        if (faultActive(FaultMode::BadCrc))
+            out[out.size() - 1] = char(uchar(out[out.size() - 1]) ^ 0xFF);
+        sendDatagram(out);
+        return;
+    }
+
+    // ---- 以下为字节流形态(TCP/串口):帧级故障 ----
     if (!isAck && faultActive(FaultMode::Merge)) {
         // 合帧:凑满两帧一次写;孤帧由 mergeFlushTimer 兜底
         mergeBuffer_.append(frame);
@@ -349,7 +495,7 @@ void DeviceSimulator::deliverFrame(const QByteArray &frame, bool isAck)
     }
     if (!isAck && faultActive(FaultMode::Fragment)) {
         // 流分片:半帧 + 15ms 后半帧,强制制造跨写边界(喂解码器半包路径)。
-        // 上一帧尾巴未补完时,新帧必须整帧排队随尾巴一起补——TCP 是有序字节流,
+        // 上一帧尾巴未补完时,新帧必须整帧排队随尾巴一起补——字节流有序,
         // 两个半帧交错(遥测与心跳同毫秒触发时)会真的腐蚀字节流,而非制造半包
         if (fragmentTail_.isEmpty()) {
             const int half = frame.size() / 2;
@@ -370,8 +516,21 @@ void DeviceSimulator::deliverFrame(const QByteArray &frame, bool isAck)
     rawWrite(out);
 }
 
+void DeviceSimulator::sendDatagram(const QByteArray &frame)
+{
+    if (!udp_)
+        return;
+    // 一报一帧(协议 §7):报文边界即帧边界,接收端无需跨报状态
+    udp_->writeDatagram(frame, params_.peerAddress, params_.peerPort);
+}
+
 void DeviceSimulator::rawWrite(const QByteArray &chunk)
 {
+    if (params_.transport == SimTransport::Serial) {
+        if (serial_ && serial_->isOpen())
+            serial_->write(chunk);
+        return;
+    }
     if (client_ && client_->state() == QAbstractSocket::ConnectedState)
         client_->write(chunk);
 }
@@ -387,6 +546,31 @@ void DeviceSimulator::closeClient()
     client_ = nullptr;
 }
 
+void DeviceSimulator::closeSerial()
+{
+    if (!serial_)
+        return;
+    // 只关端口不删对象:disconnect 窗口结束由巡检重开,信号连接保留
+    serial_->close();
+    dms::logMessage(dms::LogLevel::Info, dms::LogCategory::Net, logCtx(),
+                    QStringLiteral("serial port %1 closed (disconnect fault)")
+                        .arg(params_.serialPortName));
+}
+
+bool DeviceSimulator::reopenSerial(QString *errorOut)
+{
+    if (!serial_)
+        return false;
+    if (serial_->isOpen())
+        return true;
+    if (!serial_->open(QIODevice::ReadWrite)) {
+        if (errorOut)
+            *errorOut = serial_->errorString();
+        return false;
+    }
+    return true;
+}
+
 bool DeviceSimulator::faultActive(FaultMode mode) const
 {
     const qint64 now = clock_.elapsed();
@@ -396,14 +580,36 @@ bool DeviceSimulator::faultActive(FaultMode mode) const
     return false;
 }
 
-bool DeviceSimulator::hasClient() const
+bool DeviceSimulator::hasPeer() const
 {
-    return client_ && client_->state() == QAbstractSocket::ConnectedState;
+    switch (params_.transport) {
+    case SimTransport::Tcp:
+        return client_ && client_->state() == QAbstractSocket::ConnectedState;
+    case SimTransport::Udp:
+        return udp_ != nullptr; // 无连接概念:绑定即"对端可达"
+    case SimTransport::Serial:
+        return serial_ && serial_->isOpen();
+    }
+    return false;
 }
 
 QString DeviceSimulator::deviceId() const
 {
-    return QStringLiteral("sim-tcp-%1").arg(params_.index + 1, 2, 10, QChar::fromLatin1('0'));
+    // 前缀与形态一致:日志里一眼看出 sim 走的哪条链路
+    QString pattern = QStringLiteral("sim-tcp-%1");
+    if (params_.transport == SimTransport::Udp)
+        pattern = QStringLiteral("sim-udp-%1");
+    else if (params_.transport == SimTransport::Serial)
+        pattern = QStringLiteral("sim-ser-%1");
+    return pattern.arg(params_.index + 1, 2, 10, QChar::fromLatin1('0'));
+}
+
+QString DeviceSimulator::endpointDesc() const
+{
+    // TCP/UDP 用端口号,串口用端口名:SIM READY 同步行按此输出
+    if (params_.transport == SimTransport::Serial)
+        return params_.serialPortName;
+    return QString::number(params_.listenPort);
 }
 
 dms::LogContext DeviceSimulator::logCtx(dms::ErrorCode code) const
