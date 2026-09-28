@@ -27,15 +27,15 @@ build\src\app\dms_monitor.exe --config-dir <dir>
 
 ## 1. 使用前提
 
-使用匹配 Windows 11 或 Ubuntu 24.04 的发布包，核对发布说明、文件校验值和已知限制。当前不能直接运行 dms.exe 或 ./dms，因为本包尚未包含它们。后续发布必须写明：
+使用匹配 Windows 11 或 Ubuntu 24.04 的发布包，核对发布说明、文件校验值和已知限制。当前发布包的构成与验证状态（S8）：
 
-| 项目 | 当前状态 / 需要补全 |
+| 项目 | 状态 |
 |---|---|
-| Qt/编译器/CMake 精确版本 | S1 工程建立时实测记录 |
-| 客户端/模拟器文件名与启动参数 | 待实现并验证 |
-| Windows 平台/SQL/串口插件 | 待部署检查 |
-| Ubuntu 动态库与权限说明 | 待干净环境验证 |
-| 构建、CTest 与打包命令 | 待 CMake targets 确定后记录 |
+| Qt/编译器/CMake 精确版本 | 双环境实测记录见 [S8 跨平台证据](16_S8_CROSS_PLATFORM_EVIDENCE.md)；SQLite 引擎版本随"数据库就绪"日志在每次启动留痕 |
+| 客户端/模拟器文件名与启动参数 | `bin/dms_monitor`（`--config-dir <dir>` 可选，指定独立运行根）与 `bin/dms_simulator`（`--help` 查看全部参数）；配置模板位于 `bin/config/`，首次启动复制到运行根，已存在不覆盖 |
+| Windows 平台/SQL/串口插件 | 发布包经 windeployqt 携带 platforms/sqldrivers/串口库与 VC 运行库（`scripts\package.bat`），独立运行验证见证据文档 |
+| Ubuntu 动态库与权限说明 | Linux 包不带 Qt 库，部署机需安装系统依赖（qt6-base、qt6-serialport、SQLite 驱动，见证据文档的 apt 清单）；安装目录可只读，运行期数据全部落在运行根 |
+| 构建、CTest 与打包命令 | Windows：`scripts\build.bat [Debug\|Release]`、`scripts\package.bat`；Linux：`scripts/build.sh [Debug\|Release]`、`scripts/package.sh`；打包产物在 `dist/` |
 
 不能把“安装 Qt Runtime”当作完整部署步骤，发布包应经过独立运行验证。
 
