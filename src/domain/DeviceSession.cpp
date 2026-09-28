@@ -43,10 +43,16 @@ DeviceSession::DeviceSession(QString deviceId, dms::transport::ITransport *trans
             &DeviceSession::onTransportClosed);
     connect(transport_, &dms::transport::ITransport::writeAccepted, this,
             &DeviceSession::onWriteAccepted);
-    connect(transport_, &dms::transport::ITransport::bytesReceived, this,
-            &DeviceSession::onBytesReceived);
     connect(transport_, &dms::transport::ITransport::errorOccurred, this,
             &DeviceSession::onTransportError);
+    if (config_.transportKind == dms::transport::TransportKind::Udp) {
+        // UDP 单报入口:报文边界保留,来源已在传输层过滤(协议 §7)
+        connect(transport_, &dms::transport::ITransport::datagramReceived, this,
+                &DeviceSession::onDatagramReceived);
+    } else {
+        connect(transport_, &dms::transport::ITransport::bytesReceived, this,
+                &DeviceSession::onBytesReceived);
+    }
 }
 
 qint64 DeviceSession::defaultClock()
@@ -104,6 +110,15 @@ void DeviceSession::stop()
 quint32 DeviceSession::sendCommand(quint16 commandId,
                                    const QList<dms::protocol::CommandParam> &params)
 {
+    // UDP 不承载控制命令(协议 §7/LLD §4):不承诺可靠控制,
+    // 拒绝比"发出但永远等不到 ACK"更诚实
+    if (config_.transportKind == dms::transport::TransportKind::Udp) {
+        dms::logMessage(dms::LogLevel::Warn, dms::LogCategory::App, logCtx(),
+                        QStringLiteral("command %1 rejected: udp transport does not "
+                                       "carry commands")
+                            .arg(commandId));
+        return 0;
+    }
     // 仅 Online/Degraded 且可写时允许(LLD §4);Connecting 下命令直接拒绝
     if (state_ != SessionState::Online && state_ != SessionState::Degraded) {
         dms::logMessage(dms::LogLevel::Warn, dms::LogCategory::App, logCtx(),
@@ -207,6 +222,7 @@ void DeviceSession::onTransportOpened()
     consecutiveGoodFrames_ = 0;
     decoder_.reset();
     partialSinceMs_ = 0;
+    udpSeqBaseValid_ = false; // 新一轮基准由首条有效帧建立(协议 §7)
     // 未收到首个指标也从打开时刻计时(LLD §3):未知指标先按"未超时"处理
     for (qint64 &t : metricLastMs_)
         t = now;
@@ -233,10 +249,10 @@ void DeviceSession::onWriteAccepted(quint64 requestId)
         commands_.markWriteAccepted();
 }
 
-void DeviceSession::onBytesReceived(const QByteArray &bytes)
+// 解码结果的计数与日志(流式/单报共用):不动帧分发,只做记账。
+// badCrc 段含 Online→Degraded 迁移,两种路径共享同一状态机语义
+void DeviceSession::accountDecodedEvents(const FrameDecoder::Result &r)
 {
-    const FrameDecoder::Result r = decoder_.decode(bytes);
-
     if (r.rxOverflow)
         dms::logMessage(dms::LogLevel::Error, dms::LogCategory::Protocol,
                         logCtx(dms::ErrorCode::RxOverflow),
@@ -270,29 +286,41 @@ void DeviceSession::onBytesReceived(const QByteArray &bytes)
                         QStringLiteral("%1 unknown-type frame(s) skipped")
                             .arg(r.unknownTypeFrames));
     }
+}
+
+// 单帧分发:心跳/遥测/ACK 记账与信号,COMMAND 意外丢弃。
+// 返回"结构+载荷+CRC 全通过"的好帧(protocolHealth 口径)
+bool DeviceSession::dispatchFrame(const DecodedFrame &f)
+{
+    if (f.type == quint8(MessageType::Heartbeat)) {
+        ++framesReceived_;
+        noteValidReceive(); // 心跳刷新存活,但不刷新遥测时间(LLD §3)
+        emit heartbeatReceived(f.seq, f.timestampMs);
+        return true;
+    }
+    if (f.type == quint8(MessageType::Telemetry))
+        return handleTelemetry(f);
+    if (f.type == quint8(MessageType::CommandAck))
+        return handleCommandAck(f);
+    // 客户端会话不该收到设备侧 COMMAND;已知类型里只有这一种剩余情况
+    dms::logMessage(dms::LogLevel::Warn, dms::LogCategory::Protocol,
+                    logCtx(dms::ErrorCode::FramePayload),
+                    QStringLiteral("unexpected COMMAND frame from device, seq=%1")
+                        .arg(f.seq));
+    return false;
+}
+
+void DeviceSession::onBytesReceived(const QByteArray &bytes)
+{
+    const FrameDecoder::Result r = decoder_.decode(bytes);
+    accountDecodedEvents(r);
 
     // 有效帧计数:心跳/遥测/ACK 且载荷通过才计入(与 noteValidReceive 同口径,
     // 载荷拒绝的遥测不算"好帧",不解除连续坏 CRC)
     quint32 goodFrames = 0;
     for (const DecodedFrame &f : r.frames) {
-        if (f.type == quint8(MessageType::Heartbeat)) {
-            ++framesReceived_;
+        if (dispatchFrame(f))
             ++goodFrames;
-            noteValidReceive(); // 心跳刷新存活,但不刷新遥测时间(LLD §3)
-            emit heartbeatReceived(f.seq, f.timestampMs);
-        } else if (f.type == quint8(MessageType::Telemetry)) {
-            if (handleTelemetry(f))
-                ++goodFrames;
-        } else if (f.type == quint8(MessageType::CommandAck)) {
-            if (handleCommandAck(f))
-                ++goodFrames;
-        } else {
-            // 客户端会话不该收到设备侧 COMMAND;已知类型里只有这一种剩余情况
-            dms::logMessage(dms::LogLevel::Warn, dms::LogCategory::Protocol,
-                            logCtx(dms::ErrorCode::FramePayload),
-                            QStringLiteral("unexpected COMMAND frame from device, seq=%1")
-                                .arg(f.seq));
-        }
     }
 
     // 协议健康单块快照:纯坏头/垃圾块(两者皆 0)不发,避免空信号噪声
@@ -306,6 +334,69 @@ void DeviceSession::onBytesReceived(const QByteArray &bytes)
     } else {
         partialSinceMs_ = 0;
     }
+}
+
+// UDP 单报入口(协议 §7):一报一帧,不跨报拼接;来源已由传输层过滤,
+// sender 仅用于日志上下文(未配置来源根本到不了这里)
+void DeviceSession::onDatagramReceived(const QByteArray &bytes, const QHostAddress &sender,
+                                       quint16 senderPort)
+{
+    Q_UNUSED(sender);
+    Q_UNUSED(senderPort);
+
+    // 单报独立解码:先清流缓存,半帧绝不留到下一报
+    decoder_.reset();
+    const FrameDecoder::Result r = decoder_.decode(bytes);
+    accountDecodedEvents(r); // 坏 CRC/未知类型等链路质量事件照常计数
+
+    // 恰好一个结构完整帧才受理:多帧合一报、缺尾、超长、垃圾前缀整报拒绝
+    // (协议 §7/REQ-UDP-001)。CRC 坏/未知类型的帧也算"结构完整"——
+    // 拒绝的是报文结构异常,不是链路质量事件
+    const quint32 frameEvents = quint32(r.frames.size()) + r.unknownTypeFrames
+                                + r.badCrcFrames + r.badHeaderFrames;
+    const bool exactlyOneFrame = frameEvents == 1 && r.droppedBytes == 0
+                                 && !r.rxOverflow && decoder_.bufferedBytes() == 0;
+    if (!exactlyOneFrame) {
+        ++malformedDatagrams_;
+        dms::logMessage(dms::LogLevel::Warn, dms::LogCategory::Protocol,
+                        logCtx(dms::ErrorCode::FrameLength),
+                        QStringLiteral("datagram rejected (not exactly one frame): "
+                                       "%1 byte(s), %2 frame(s), %3 trailing")
+                            .arg(bytes.size())
+                            .arg(frameEvents)
+                            .arg(decoder_.bufferedBytes()));
+        decoder_.reset();
+        return;
+    }
+
+    quint32 goodFrames = 0;
+    for (const DecodedFrame &f : r.frames) {
+        // seq 模差防御(协议 §7):旧/重复不更新实时值、存活或落盘。
+        // 重复报文可能是缓存重放,不证明链路当前健康,也不清 CRC streak
+        if (!seqIsNew(f.seq)) {
+            ++staleSeqFrames_;
+            dms::logMessage(dms::LogLevel::Info, dms::LogCategory::Protocol, logCtx(),
+                            QStringLiteral("stale/duplicate seq %1 dropped").arg(f.seq));
+            continue;
+        }
+        udpLastSeq_ = f.seq;
+        udpSeqBaseValid_ = true;
+        // UDP 只承载 HEARTBEAT/TELEMETRY(协议 §7):ACK/COMMAND 意外,丢弃记日志
+        if (f.type != quint8(MessageType::Heartbeat)
+            && f.type != quint8(MessageType::Telemetry)) {
+            dms::logMessage(dms::LogLevel::Warn, dms::LogCategory::Protocol,
+                            logCtx(dms::ErrorCode::FramePayload),
+                            QStringLiteral("unexpected frame type %1 over udp, seq=%2")
+                                .arg(f.type)
+                                .arg(f.seq));
+            continue;
+        }
+        if (dispatchFrame(f))
+            ++goodFrames;
+    }
+
+    if (r.badCrcFrames > 0 || goodFrames > 0)
+        emit protocolHealth(r.badCrcFrames, goodFrames);
 }
 
 bool DeviceSession::handleTelemetry(const DecodedFrame &frame)
@@ -416,6 +507,12 @@ void DeviceSession::noteValidReceive()
         if (metricsAllFresh(now)
             && ++consecutiveGoodFrames_ >= config_.goodFramesToRecoverOnline)
             setState(SessionState::Online);
+    } else if (state_ == SessionState::Reconnecting) {
+        // UDP:失联期间绑定仍在等数据,数据回来了直接恢复,不等退避到期
+        // (LLD §3"收到新的有效遥测直接恢复");TCP/串口 transport 已关,
+        // 此路径对它们不可达
+        firstValidSeen_ = true;
+        setState(metricsAllFresh(now) ? SessionState::Online : SessionState::Degraded);
     }
 }
 
@@ -479,8 +576,15 @@ void DeviceSession::enterReconnecting(const QString &reason, dms::ErrorCode code
     setState(SessionState::Reconnecting);
     dms::logMessage(dms::LogLevel::Warn, dms::LogCategory::Net, logCtx(code),
                     QStringLiteral("entering reconnect backoff: %1").arg(reason));
-    closeByUs_ = true;
-    transport_->close(); // 关旧 transport(幂等:已关则无副作用)
+    if (config_.transportKind == dms::transport::TransportKind::Udp) {
+        // UDP:保持绑定等数据,不建 TCP 式连接(LLD §3);退避重试点上
+        // open() 幂等确认绑定仍在。失联清 seq 基准:恢复后第一条有效帧
+        // 重建基准,允许设备重启后序号归零(协议 §7)
+        udpSeqBaseValid_ = false;
+    } else {
+        closeByUs_ = true;
+        transport_->close(); // 关旧 transport(幂等:已关则无副作用)
+    }
     retryAtMs_ = clock_() + backoffDelayMs();
 }
 
@@ -502,6 +606,16 @@ void DeviceSession::finishPending(std::optional<CommandOutcome> outcome)
         outcome->sessionId = sessionId_; // 入库按会话定位唯一键(S5)
         emit commandFinished(*outcome);
     }
+}
+
+bool DeviceSession::seqIsNew(quint32 seq) const
+{
+    if (!udpSeqBaseValid_)
+        return true; // 首轮或失联清除后:任何 seq 都可作为新基准
+    // 模差判断(协议 §7):无符号算术天然 mod 2^32,
+    // 0<d<2^31 为新;d=0 重复;d≥2^31 旧/乱序(含设备重启归零的回绕接受)
+    const quint32 d = seq - udpLastSeq_;
+    return d != 0 && d < 0x80000000u;
 }
 
 dms::LogContext DeviceSession::logCtx(dms::ErrorCode code) const

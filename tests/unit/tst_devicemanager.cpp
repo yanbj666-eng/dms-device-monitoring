@@ -131,8 +131,41 @@ DeviceSetup setupFor(const QString &id)
 {
     DeviceSetup setup;
     setup.deviceId = id;
-    setup.transport.host = QStringLiteral("127.0.0.1");
-    setup.transport.port = 9001;
+    // 默认工厂会真连 127.0.0.1:9001(失败即走退避,测试注入 FakeTransport
+    // 时无副作用);variant 活化 tcp 分支,与生产装配同构
+    dms::transport::TcpTransportConfig cfg;
+    cfg.deviceId = id;
+    cfg.host = QStringLiteral("127.0.0.1");
+    cfg.port = 9001;
+    setup.transport = cfg;
+    return setup;
+}
+
+// UDP/Serial 分支的 setup(variant 活化 + transportKind 填充,装配同构)
+DeviceSetup udpSetupFor(const QString &id, quint16 bindPort, quint16 peerPort)
+{
+    DeviceSetup setup;
+    setup.deviceId = id;
+    dms::transport::UdpTransportConfig cfg;
+    cfg.deviceId = id;
+    cfg.bindAddress = QHostAddress(QHostAddress::LocalHost);
+    cfg.bindPort = bindPort;
+    cfg.peerAddress = QHostAddress(QHostAddress::LocalHost);
+    cfg.peerPort = peerPort;
+    setup.transport = cfg;
+    setup.session.transportKind = dms::transport::TransportKind::Udp;
+    return setup;
+}
+
+DeviceSetup serialSetupFor(const QString &id, const QString &portName)
+{
+    DeviceSetup setup;
+    setup.deviceId = id;
+    dms::transport::SerialTransportConfig cfg;
+    cfg.deviceId = id;
+    cfg.portName = portName;
+    setup.transport = cfg;
+    setup.session.transportKind = dms::transport::TransportKind::Serial;
     return setup;
 }
 

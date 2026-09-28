@@ -115,7 +115,10 @@ private slots:
     void mixedTransportFields();
     void portRange();
     void duplicateEndpoint();
-    void udpEnabledRejected();
+    void udpEnabledValidatesAndStores();
+    void udpTupleUniqueness();
+    void serialPortOccupancy();
+    void serialEnabledValidatesAndStores();
     void udpDisabledWithBadAddress();
     void serialBadEnum();
     void alarmRuleMetricRange();
@@ -333,7 +336,8 @@ void TestConfig::duplicateEndpoint()
     QVERIFY(hasIssueFor(loaded.issues, "devices[1]", "占用"));
 }
 
-void TestConfig::udpEnabledRejected()
+// S7 起 udp 设备可启用;四字段进入快照供装配建会话
+void TestConfig::udpEnabledValidatesAndStores()
 {
     QTemporaryDir runRoot;
     const QString udp = QStringLiteral(
@@ -343,8 +347,87 @@ void TestConfig::udpEnabledRejected()
     writeUtf8(runRoot, "config/devices.json", devicesJson(udp).toUtf8());
     writeUtf8(runRoot, "config/app.ini", kValidIni);
     const LoadedConfig loaded = loadConfiguration(runRoot.path(), runRoot.path());
+    QVERIFY(loaded.ok);
+    QCOMPARE(loaded.devices.size(), 1);
+    const auto &dev = loaded.devices.first();
+    QVERIFY(dev.enabled);
+    QCOMPARE(dev.transport, QStringLiteral("udp"));
+    QCOMPARE(dev.bindAddress, QStringLiteral("127.0.0.1"));
+    QCOMPARE(dev.bindPort, quint16(9100));
+    QCOMPARE(dev.peerAddress, QStringLiteral("127.0.0.1"));
+    QCOMPARE(dev.peerPort, quint16(9101));
+}
+
+// udp 四元组唯一(docs/15 §3);同 bind 不同 peer 合法(共享 socket 按来源路由)
+void TestConfig::udpTupleUniqueness()
+{
+    QTemporaryDir runRoot;
+    const auto mk = [](const char *id, const char *peerPort, const char *bindPort) {
+        return QStringLiteral(
+            "{\"id\":\"%1\",\"name\":\"U\",\"enabled\":true,\"transport\":\"udp\","
+            "\"bind_address\":\"127.0.0.1\",\"bind_port\":%2,"
+            "\"peer_address\":\"127.0.0.1\",\"peer_port\":%3,\"alarm_rules\":[]}")
+            .arg(QLatin1String(id), QLatin1String(bindPort), QLatin1String(peerPort));
+    };
+    // 同 bind 不同 peer:合法
+    writeUtf8(runRoot, "config/devices.json",
+              devicesJson(mk("u1", "9201", "9100") + "," + mk("u2", "9202", "9100")).toUtf8());
+    writeUtf8(runRoot, "config/app.ini", kValidIni);
+    QVERIFY(loadConfiguration(runRoot.path(), runRoot.path()).ok);
+
+    // 完整四元组重复:拒绝
+    writeUtf8(runRoot, "config/devices.json",
+              devicesJson(mk("u1", "9201", "9100") + "," + mk("u2", "9201", "9100")).toUtf8());
+    const LoadedConfig loaded = loadConfiguration(runRoot.path(), runRoot.path());
     QVERIFY(!loaded.ok);
-    QVERIFY(hasIssueFor(loaded.issues, "devices[0]", "S4"));
+    QVERIFY(hasIssueFor(loaded.issues, "devices[1]", "四元组"));
+}
+
+// 启用设备不能重复占用同一串口;停用设备同名不冲突(docs/15 §3)
+void TestConfig::serialPortOccupancy()
+{
+    QTemporaryDir runRoot;
+    const auto mk = [](const char *id, bool enabled) {
+        return QStringLiteral(
+            "{\"id\":\"%1\",\"name\":\"S\",\"enabled\":%2,\"transport\":\"serial\","
+            "\"port_name\":\"COM3\",\"baud_rate\":115200,\"data_bits\":8,"
+            "\"parity\":\"none\",\"stop_bits\":1,\"flow_control\":\"none\","
+            "\"alarm_rules\":[]}")
+            .arg(QLatin1String(id), enabled ? QStringLiteral("true") : QStringLiteral("false"));
+    };
+    // 两个都停用:合法(不打开串口)
+    writeUtf8(runRoot, "config/devices.json",
+              devicesJson(mk("s1", false) + "," + mk("s2", false)).toUtf8());
+    writeUtf8(runRoot, "config/app.ini", kValidIni);
+    QVERIFY(loadConfiguration(runRoot.path(), runRoot.path()).ok);
+
+    // 都启用:第二个被拒
+    writeUtf8(runRoot, "config/devices.json",
+              devicesJson(mk("s1", true) + "," + mk("s2", true)).toUtf8());
+    const LoadedConfig loaded = loadConfiguration(runRoot.path(), runRoot.path());
+    QVERIFY(!loaded.ok);
+    QVERIFY(hasIssueFor(loaded.issues, "devices[1]", "串口"));
+}
+
+// serial 全字段进入快照供装配映射(QSerialPort 枚举由 main 装配转换)
+void TestConfig::serialEnabledValidatesAndStores()
+{
+    QTemporaryDir runRoot;
+    const QString serial = QStringLiteral(
+        "{\"id\":\"s1\",\"name\":\"S\",\"enabled\":true,\"transport\":\"serial\","
+        "\"port_name\":\"COM3\",\"baud_rate\":57600,\"data_bits\":7,\"parity\":\"even\","
+        "\"stop_bits\":2,\"flow_control\":\"hardware\",\"alarm_rules\":[]}");
+    writeUtf8(runRoot, "config/devices.json", devicesJson(serial).toUtf8());
+    writeUtf8(runRoot, "config/app.ini", kValidIni);
+    const LoadedConfig loaded = loadConfiguration(runRoot.path(), runRoot.path());
+    QVERIFY(loaded.ok);
+    const auto &dev = loaded.devices.first();
+    QCOMPARE(dev.portName, QStringLiteral("COM3"));
+    QCOMPARE(dev.baudRate, qint32(57600));
+    QCOMPARE(dev.dataBits, 7);
+    QCOMPARE(dev.parity, QStringLiteral("even"));
+    QCOMPARE(dev.stopBits, 2);
+    QCOMPARE(dev.flowControl, QStringLiteral("hardware"));
 }
 
 void TestConfig::udpDisabledWithBadAddress()

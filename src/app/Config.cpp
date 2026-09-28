@@ -268,10 +268,6 @@ void parseDevice(const QJsonObject &device, const QString &path,
         if (jsonInt(device, QStringLiteral("port"), 1, 65535, path, &port, issues))
             out->port = quint16(port);
     } else if (transport == QStringLiteral("udp")) {
-        if (out->enabled) {
-            // S4 只有 TCP 会话:启用即显式拒绝,不悄悄跳过或降级(docs/15 §3)
-            issues->add(path, QStringLiteral("S4 仅支持 tcp,启用的 udp 设备暂不可用"));
-        }
         for (const QString &k : device.keys()) {
             if ((tcpKeys().contains(k) && !udpKeys().contains(k)))
                 issues->add(path + "." + k, QStringLiteral("udp 设备不允许的 tcp 字段"));
@@ -279,21 +275,26 @@ void parseDevice(const QJsonObject &device, const QString &path,
                 issues->add(path + "." + k, QStringLiteral("udp 设备不允许的 serial 字段"));
         }
         QString bind, peer;
-        if (jsonString(device, QStringLiteral("bind_address"), path, &bind, issues)
-            && !isValidIpAddress(bind))
-            issues->add(path + ".bind_address", QStringLiteral("应为合法 IP"));
+        if (jsonString(device, QStringLiteral("bind_address"), path, &bind, issues)) {
+            if (!isValidIpAddress(bind))
+                issues->add(path + ".bind_address", QStringLiteral("应为合法 IP"));
+            else
+                out->bindAddress = bind;
+        }
         if (jsonString(device, QStringLiteral("peer_address"), path, &peer, issues)) {
             if (!isValidIpAddress(peer))
                 issues->add(path + ".peer_address", QStringLiteral("应为合法 IP"));
             else if (peer == QStringLiteral("0.0.0.0") || peer == QStringLiteral("::"))
                 issues->add(path + ".peer_address", QStringLiteral("不允许通配地址"));
+            else
+                out->peerAddress = peer;
         }
         qint64 bindPort = 0, peerPort = 0;
-        jsonInt(device, QStringLiteral("bind_port"), 1, 65535, path, &bindPort, issues);
-        jsonInt(device, QStringLiteral("peer_port"), 1, 65535, path, &peerPort, issues);
+        if (jsonInt(device, QStringLiteral("bind_port"), 1, 65535, path, &bindPort, issues))
+            out->bindPort = quint16(bindPort);
+        if (jsonInt(device, QStringLiteral("peer_port"), 1, 65535, path, &peerPort, issues))
+            out->peerPort = quint16(peerPort);
     } else { // serial
-        if (out->enabled)
-            issues->add(path, QStringLiteral("S4 仅支持 tcp,启用的 serial 设备暂不可用"));
         for (const QString &k : device.keys()) {
             if ((tcpKeys().contains(k) && !serialKeys().contains(k)))
                 issues->add(path + "." + k, QStringLiteral("serial 设备不允许的 tcp 字段"));
@@ -301,18 +302,26 @@ void parseDevice(const QJsonObject &device, const QString &path,
                 issues->add(path + "." + k, QStringLiteral("serial 设备不允许的 udp 字段"));
         }
         QString portName;
-        if (jsonString(device, QStringLiteral("port_name"), path, &portName, issues)
-            && portName.isEmpty())
-            issues->add(path + ".port_name", QStringLiteral("不允许为空"));
+        if (jsonString(device, QStringLiteral("port_name"), path, &portName, issues)) {
+            if (portName.isEmpty())
+                issues->add(path + ".port_name", QStringLiteral("不允许为空"));
+            else
+                out->portName = portName;
+        }
         static const QList<qint64> kBauds = {9600, 19200, 38400, 57600, 115200};
         qint64 baud = 0, dataBits = 0, stopBits = 0;
-        if (jsonInt(device, QStringLiteral("baud_rate"), 9600, 115200, path, &baud, issues)
-            && !kBauds.contains(baud)) {
-            issues->add(path + ".baud_rate",
-                        QStringLiteral("应为 9600/19200/38400/57600/115200 之一"));
+        if (jsonInt(device, QStringLiteral("baud_rate"), 9600, 115200, path, &baud, issues)) {
+            if (!kBauds.contains(baud)) {
+                issues->add(path + ".baud_rate",
+                            QStringLiteral("应为 9600/19200/38400/57600/115200 之一"));
+            } else {
+                out->baudRate = qint32(baud);
+            }
         }
-        jsonInt(device, QStringLiteral("data_bits"), 7, 8, path, &dataBits, issues);
-        jsonInt(device, QStringLiteral("stop_bits"), 1, 2, path, &stopBits, issues);
+        if (jsonInt(device, QStringLiteral("data_bits"), 7, 8, path, &dataBits, issues))
+            out->dataBits = int(dataBits);
+        if (jsonInt(device, QStringLiteral("stop_bits"), 1, 2, path, &stopBits, issues))
+            out->stopBits = int(stopBits);
         for (const char *field : {"parity", "flow_control"}) {
             QString value;
             if (jsonString(device, QLatin1String(field), path, &value, issues)) {
@@ -322,8 +331,13 @@ void parseDevice(const QJsonObject &device, const QString &path,
                                                   QStringLiteral("hardware"),
                                                   QStringLiteral("software")};
                 const bool ok = field[0] == 'p' ? kParity.contains(value) : kFlow.contains(value);
-                if (!ok)
+                if (!ok) {
                     issues->add(path + "." + field, QStringLiteral("枚举值非法"));
+                } else if (field[0] == 'p') {
+                    out->parity = value;
+                } else {
+                    out->flowControl = value;
+                }
             }
         }
     }
@@ -365,8 +379,11 @@ void parseDevicesJson(const QByteArray &bytes, QList<DeviceConnectionConfig> *de
         return;
     }
 
-    // 跨设备唯一性:id、tcp 端点(docs/15 §3;udp 四元组/串口名的占用检查随 S7 生效)
-    QSet<QString> ids, tcpEndpoints;
+    // 跨设备唯一性(docs/15 §3):id、tcp host/port、udp 四元组、串口名。
+    // UDP 允许同 bind 不同 peer(共享 socket 按来源路由,协议 §7),
+    // 但四元组整体唯一;串口仅启用设备查重——停用设备不打开串口,
+    // 同名配置允许保留(等启用时再暴露冲突)
+    QSet<QString> ids, tcpEndpoints, udpTuples, enabledSerialPorts;
     int index = 0;
     for (const QJsonValue &item : devs.toArray()) {
         const QString path = QStringLiteral("devices[%1]").arg(index++);
@@ -392,6 +409,26 @@ void parseDevicesJson(const QByteArray &bytes, QList<DeviceConnectionConfig> *de
                 tcpEndpoints.insert(endpoint);
             } else {
                 issues->add(path, QStringLiteral("host/port 已被其他设备占用:%1").arg(endpoint));
+                continue;
+            }
+        } else if (cfg.transport == QStringLiteral("udp")) {
+            const QString tuple = cfg.bindAddress + QStringLiteral(":")
+                                  + QString::number(cfg.bindPort) + QStringLiteral(",")
+                                  + cfg.peerAddress + QStringLiteral(":")
+                                  + QString::number(cfg.peerPort);
+            if (!udpTuples.contains(tuple)) {
+                udpTuples.insert(tuple);
+            } else {
+                issues->add(path, QStringLiteral("udp 四元组已被其他设备占用:%1").arg(tuple));
+                continue;
+            }
+        } else if (cfg.enabled) {
+            // 停用设备不占串口,启用设备不能重复占用同一串口(docs/15 §3)
+            if (!enabledSerialPorts.contains(cfg.portName)) {
+                enabledSerialPorts.insert(cfg.portName);
+            } else {
+                issues->add(path, QStringLiteral("串口已被启用的其他设备占用:%1")
+                                       .arg(cfg.portName));
                 continue;
             }
         }

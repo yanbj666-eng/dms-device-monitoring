@@ -1,5 +1,7 @@
 #include "DeviceManager.h"
 
+#include <type_traits>
+
 #include "common/Logging.h"
 
 namespace dms::domain {
@@ -14,11 +16,25 @@ DeviceManager::DeviceManager(QObject *parent)
         "QList<dms::protocol::CommandParam>");
     qRegisterMetaType<dms::domain::CommandSubmission>("dms::domain::CommandSubmission");
 
-    // 默认工厂:S4 仅 TCP;transport 配置里的 deviceId 只用于日志上下文
+    // 默认工厂:按 DeviceSetup 的 variant 活化分支建对应 transport
+    // (S7 起三形态);测试注入 FakeTransport 时整体替换。
+    // transport 配置里的 deviceId 只用于日志上下文
     transportFactory_ = [](const DeviceSetup &setup) {
-        dms::transport::TcpTransportConfig cfg = setup.transport;
-        cfg.deviceId = setup.deviceId;
-        return static_cast<dms::transport::ITransport *>(new dms::transport::TcpTransport(cfg));
+        const auto withId = [id = setup.deviceId](auto cfg) {
+            cfg.deviceId = id;
+            return cfg;
+        };
+        return std::visit(
+            [&withId](const auto &cfg) -> dms::transport::ITransport * {
+                using T = std::decay_t<decltype(cfg)>;
+                if constexpr (std::is_same_v<T, dms::transport::TcpTransportConfig>)
+                    return new dms::transport::TcpTransport(withId(cfg));
+                else if constexpr (std::is_same_v<T, dms::transport::UdpTransportConfig>)
+                    return new dms::transport::UdpTransport(withId(cfg));
+                else
+                    return new dms::transport::SerialTransport(withId(cfg));
+            },
+            setup.transport);
     };
 }
 

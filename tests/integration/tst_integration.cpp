@@ -223,6 +223,20 @@ bool findManagerFinished(const QSignalSpy &spy, quint16 commandId)
     return false;
 }
 
+// S7 起 DeviceSetup.transport 是 variant:TCP 用例统一经此构型
+// (S7 的 UDP/Serial E2E 在后续提交加入)
+dms::domain::DeviceSetup tcpSetup(const QString &id, quint16 port)
+{
+    dms::domain::DeviceSetup setup;
+    setup.deviceId = id;
+    dms::transport::TcpTransportConfig cfg;
+    cfg.deviceId = id;
+    cfg.host = QStringLiteral("127.0.0.1");
+    cfg.port = port;
+    setup.transport = cfg;
+    return setup;
+}
+
 } // namespace
 
 // 事件循环保持运转地等到锚点时刻(QTRY 每步处理事件,socket/timer 不挨饿)
@@ -676,11 +690,8 @@ void TestIntegration::persistenceRoundTrip()
 {
     QVERIFY(sim_.start(1, 100, {}));
 
-    dms::domain::DeviceSetup setup;
-    setup.deviceId = QStringLiteral("itest-07");
-    setup.transport.deviceId = setup.deviceId;
-    setup.transport.host = QStringLiteral("127.0.0.1");
-    setup.transport.port = sim_.portAt(0);
+    dms::domain::DeviceSetup setup =
+        tcpSetup(QStringLiteral("itest-07"), sim_.portAt(0));
     DeviceManager manager;
 
     QTemporaryDir dir;
@@ -796,11 +807,8 @@ void TestIntegration::alarmThresholdsEndToEnd()
                        {QStringLiteral("-f"), QStringLiteral("abnormalValue@600+1000")}));
 
     const QString id = QStringLiteral("itest-11");
-    dms::domain::DeviceSetup setup;
-    setup.deviceId = id;
-    setup.transport.deviceId = id;
-    setup.transport.host = QStringLiteral("127.0.0.1");
-    setup.transport.port = sim_.portAt(0);
+    const dms::domain::DeviceSetup setup =
+        tcpSetup(id, sim_.portAt(0));
 
     // 默认参数即 app.ini [connection] 默认值:poll 100/stale 3000/坏 CRC 5/好 3
     dms::domain::AlarmEngine engine{dms::domain::AlarmEngine::Settings{}};
@@ -904,11 +912,8 @@ void TestIntegration::alarmCrcEndToEnd()
                        {QStringLiteral("-f"), QStringLiteral("badCrc@600+1000")}));
 
     const QString id = QStringLiteral("itest-13");
-    dms::domain::DeviceSetup setup;
-    setup.deviceId = id;
-    setup.transport.deviceId = id;
-    setup.transport.host = QStringLiteral("127.0.0.1");
-    setup.transport.port = sim_.portAt(0);
+    const dms::domain::DeviceSetup setup =
+        tcpSetup(id, sim_.portAt(0));
 
     DeviceManager manager;
     dms::domain::AlarmEngine engine{dms::domain::AlarmEngine::Settings{}};
@@ -942,11 +947,8 @@ void TestIntegration::alarmStaleAndCommLostEndToEnd()
                        {QStringLiteral("-f"), QStringLiteral("stopSending@600+6000")}));
 
     const QString id = QStringLiteral("itest-14");
-    dms::domain::DeviceSetup setup;
-    setup.deviceId = id;
-    setup.transport.deviceId = id;
-    setup.transport.host = QStringLiteral("127.0.0.1");
-    setup.transport.port = sim_.portAt(0);
+    const dms::domain::DeviceSetup setup =
+        tcpSetup(id, sim_.portAt(0));
 
     DeviceManager manager;
     dms::domain::AlarmEngine engine{dms::domain::AlarmEngine::Settings{}};
@@ -995,11 +997,8 @@ void TestIntegration::acquisitionPauseExemptsStaleAlarm()
     QVERIFY(sim_.start(1, 100, {}));
 
     const QString id = QStringLiteral("itest-15");
-    dms::domain::DeviceSetup setup;
-    setup.deviceId = id;
-    setup.transport.deviceId = id;
-    setup.transport.host = QStringLiteral("127.0.0.1");
-    setup.transport.port = sim_.portAt(0);
+    const dms::domain::DeviceSetup setup =
+        tcpSetup(id, sim_.portAt(0));
 
     DeviceManager manager;
     dms::domain::AlarmEngine engine{dms::domain::AlarmEngine::Settings{}};

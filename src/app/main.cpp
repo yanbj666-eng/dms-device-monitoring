@@ -3,7 +3,9 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QFileInfo>
+#include <QHostAddress>
 #include <QMessageBox>
+#include <QSerialPort>
 #include <QStandardPaths>
 #include <QThread>
 
@@ -63,20 +65,52 @@ int main(int argc, char *argv[])
                         .arg(QDir(runRoot).absolutePath())
                         .arg(loaded.devices.size()));
 
-    // LoadedConfig → DeviceSetup:仅 tcp 且启用的设备建会话(S4 范围)
+    // LoadedConfig → DeviceSetup:启用的设备按 transport 形态建会话(S7 起三形态);
+    // app.ini 共享参数合入对应分支,session.transportKind 决定状态机链路语义
     QList<dms::domain::DeviceSetup> setups;
     QVector<QPair<QString, QString>> deviceIdNames;
     for (const dms::app::DeviceConnectionConfig &dev : loaded.devices) {
-        if (dev.transport != QStringLiteral("tcp") || !dev.enabled)
+        if (!dev.enabled)
             continue;
         dms::domain::DeviceSetup setup;
         setup.deviceId = dev.id;
-        setup.transport.deviceId = dev.id;
-        setup.transport.host = dev.host;
-        setup.transport.port = dev.port;
-        setup.transport.connectTimeoutMs = loaded.app.transport.connectTimeoutMs;
-        setup.transport.maxTxBytes = loaded.app.transport.maxTxBytes;
         setup.session = loaded.app.session;
+        if (dev.transport == QStringLiteral("tcp")) {
+            dms::transport::TcpTransportConfig cfg;
+            cfg.deviceId = dev.id;
+            cfg.host = dev.host;
+            cfg.port = dev.port;
+            cfg.connectTimeoutMs = loaded.app.transport.connectTimeoutMs;
+            cfg.maxTxBytes = loaded.app.transport.maxTxBytes;
+            setup.transport = cfg;
+        } else if (dev.transport == QStringLiteral("udp")) {
+            dms::transport::UdpTransportConfig cfg;
+            cfg.deviceId = dev.id;
+            cfg.bindAddress = QHostAddress(dev.bindAddress);
+            cfg.bindPort = dev.bindPort;
+            cfg.peerAddress = QHostAddress(dev.peerAddress);
+            cfg.peerPort = dev.peerPort;
+            setup.transport = cfg;
+            setup.session.transportKind = dms::transport::TransportKind::Udp;
+        } else {
+            dms::transport::SerialTransportConfig cfg;
+            cfg.deviceId = dev.id;
+            cfg.portName = dev.portName;
+            cfg.baudRate = dev.baudRate;
+            cfg.dataBits = dev.dataBits == 7 ? QSerialPort::Data7 : QSerialPort::Data8;
+            cfg.parity = dev.parity == QStringLiteral("even")   ? QSerialPort::EvenParity
+                         : dev.parity == QStringLiteral("odd")   ? QSerialPort::OddParity
+                                                                 : QSerialPort::NoParity;
+            cfg.stopBits = dev.stopBits == 2 ? QSerialPort::TwoStop : QSerialPort::OneStop;
+            cfg.flowControl = dev.flowControl == QStringLiteral("hardware")
+                                  ? QSerialPort::HardwareControl
+                              : dev.flowControl == QStringLiteral("software")
+                                  ? QSerialPort::SoftwareControl
+                                  : QSerialPort::NoFlowControl;
+            cfg.maxTxBytes = loaded.app.transport.maxTxBytes;
+            setup.transport = cfg;
+            setup.session.transportKind = dms::transport::TransportKind::Serial;
+        }
         setups.append(setup);
         deviceIdNames.append({dev.id, dev.name});
     }
@@ -112,10 +146,11 @@ int main(int argc, char *argv[])
     QObject::connect(&ioThread, &QThread::finished, alarmEngine,
                       &QObject::deleteLater);
 
-    // 规则快照在 GUI 线程建好,started 槽里随会话一起注入(同线程,免锁)
+    // 规则快照在 GUI 线程建好,started 槽里随会话一起注入(同线程,免锁);
+    // S7 起三形态设备都参与评估(规则本身与传输形态无关)
     QHash<QString, QList<dms::domain::AlarmRule>> alarmRules;
     for (const dms::app::DeviceConnectionConfig &dev : loaded.devices) {
-        if (dev.transport != QStringLiteral("tcp") || !dev.enabled)
+        if (!dev.enabled)
             continue; // 只有建会话的设备才评估
         QList<dms::domain::AlarmRule> rules;
         for (const dms::app::AlarmRuleConfig &r : dev.alarmRules) {

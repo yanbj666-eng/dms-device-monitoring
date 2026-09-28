@@ -19,8 +19,8 @@ struct AlarmRuleConfig {
 };
 
 // 单台设备连接配置(devices.json 一项,校验通过后的快照)。
-// transport 为 tcp/udp/serial 三者之一;S4 只有 TCP 会话实现,
-// 启用的非 tcp 设备在加载期被拒绝(docs/15:不能悄悄改默认值)。
+// transport 为 tcp/udp/serial 三者之一;三种形态的专用字段由
+// docs/15 §3 白名单互斥校验,装配层按 transport 取对应字段组
 struct DeviceConnectionConfig {
     QString id;
     QString name;
@@ -29,6 +29,19 @@ struct DeviceConnectionConfig {
     // tcp 专用字段
     QString host;
     quint16 port = 0;
+    // udp 专用字段(S7):bind 是本地监听端点,peer 是唯一合法来源;
+    // 字符串形态与 JSON 同构,装配层转 QHostAddress
+    QString bindAddress;
+    quint16 bindPort = 0;
+    QString peerAddress;
+    quint16 peerPort = 0;
+    // serial 专用字段(S7):枚举字段存字符串,装配层转 QSerialPort 枚举
+    QString portName;
+    qint32 baudRate = 115200;
+    int dataBits = 8;
+    QString parity;        // "none"|"even"|"odd"
+    int stopBits = 1;
+    QString flowControl;   // "none"|"hardware"|"software"
     QList<AlarmRuleConfig> alarmRules;
     // 原始对象紧凑文本(重新序列化,键序可能与源文件不同):
     // devices 表 config_json 镜像用,不掺默认值(docs/06 §1,S5 消费)

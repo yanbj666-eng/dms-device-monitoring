@@ -6,10 +6,14 @@
 #include <QString>
 
 #include <functional>
+#include <variant>
 
 #include "DeviceSession.h"
 #include "MessageCodec.h"
+#include "transport/ITransport.h"
+#include "transport/SerialTransport.h"
 #include "transport/TcpTransport.h"
+#include "transport/UdpTransport.h"
 
 namespace dms::domain {
 
@@ -17,8 +21,13 @@ namespace dms::domain {
 // queued 传给 IO 线程的 DeviceManager(依赖方向 app -> domain,不反向)
 struct DeviceSetup {
     QString deviceId;
-    dms::transport::TcpTransportConfig transport;
-    dms::domain::SessionConfig session;
+    // 三形态连接配置,活化分支由 devices.json 的 transport 决定;
+    // app.ini 共享参数(connect_timeout/max_tx)由装配层合入对应分支。
+    // 值对象,queued 传递安全(三个 config 均可拷贝)
+    std::variant<dms::transport::TcpTransportConfig,
+                 dms::transport::UdpTransportConfig,
+                 dms::transport::SerialTransportConfig> transport;
+    dms::domain::SessionConfig session; // transportKind 已按形态填好
     bool connectOnStart = true;
 };
 

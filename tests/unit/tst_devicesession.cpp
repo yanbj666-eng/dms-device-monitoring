@@ -39,6 +39,7 @@ public:
     bool deferOpen = false;    // true: open() 不发 opened(停在 Connecting)
     bool acceptWrites = true;  // false: write() 不发 writeAccepted
     int openCount = 0;
+    int closeCount = 0;        // UDP 失联不关绑定的断言用(LLD §3)
     QList<QByteArray> written;
 
     void open() override
@@ -47,7 +48,11 @@ public:
         if (!deferOpen)
             emit opened();
     }
-    void close() override { emit closed(); }
+    void close() override
+    {
+        ++closeCount;
+        emit closed();
+    }
     void write(const QByteArray &bytes, quint64 requestId) override
     {
         written.append(bytes);
@@ -57,6 +62,11 @@ public:
     bool isOpen() const override { return true; }
 
     void feed(const QByteArray &bytes) { emit bytesReceived(bytes); }
+    // UDP 单报入口:来源任意(真来源过滤在 UdpTransport,不归会话管)
+    void feedDatagram(const QByteArray &bytes)
+    {
+        emit datagramReceived(bytes, QHostAddress(QHostAddress::LocalHost), 55001);
+    }
     void injectError(dms::transport::TransportError e) { emit errorOccurred(e); }
     void completeOpen() { emit opened(); } // deferOpen 后异步补发"握手完成"
 };
@@ -136,7 +146,24 @@ struct Rig {
         transport->feed(telemetryFrame(seq, quint64(now), fourSamples()));
         QCOMPARE(session->state(), SessionState::Online);
     }
+
+    // UDP 版:首条四指标遥测经单报入口 → Online(seq 基准同步建立)
+    void goOnlineUdp(quint32 seq = 100)
+    {
+        session->start();
+        QCOMPARE(session->state(), SessionState::Connecting);
+        transport->feedDatagram(telemetryFrame(seq, quint64(now), fourSamples()));
+        QCOMPARE(session->state(), SessionState::Online);
+    }
 };
+
+// S7 UDP 会话配置(jitter 0,退避序列可精确断言)
+SessionConfig udpConfig()
+{
+    SessionConfig c;
+    c.transportKind = dms::transport::TransportKind::Udp;
+    return c;
+}
 
 } // namespace
 
@@ -192,6 +219,16 @@ private slots:
     void protocolHealthSkipsPayloadRejectedAndBadHeader();
     void stopAckExemptsStaleFromHealthCheck();
     void startAckResumesStaleWindow();
+
+    // ---- S7:UDP 链路语义(协议 §7/LLD §3) ----
+    void udpDatagramTelemetryGoesOnline();
+    void udpMalformedDatagramRejected();
+    void udpDuplicateAndStaleSeqDropped();
+    void udpSeqWraparoundAccepted();
+    void udpStaleSeqDoesNotKeepAliveAndClearsBase();
+    void udpReconnectingRecoversOnDataWithoutReopen();
+    void udpCommandRejected();
+    void udpBackoffRetryReconfirmsBind();
 
 private:
     QTemporaryDir tempRoot_;
@@ -997,6 +1034,154 @@ void TestDeviceSession::startAckResumesStaleWindow()
 
     rig.advance(1); // 恰 3000ms:陈旧检测恢复,降级
     QCOMPARE(rig.session->state(), SessionState::Degraded);
+}
+
+// ---- S7:UDP 链路语义(协议 §7/LLD §3) ----
+
+// 一报一帧:合法单报照常建链上线,坏报计数为 0
+void TestDeviceSession::udpDatagramTelemetryGoesOnline()
+{
+    Rig rig(udpConfig());
+    QSignalSpy telSpy(rig.session.get(), &DeviceSession::telemetryReceived);
+    rig.goOnlineUdp(100);
+
+    QCOMPARE(telSpy.size(), 1);
+    QCOMPARE(rig.session->malformedDatagrams(), quint32(0));
+    QCOMPARE(rig.session->staleSeqFrames(), quint32(0));
+}
+
+// 整报拒绝:两帧一报/半帧/垃圾前缀都不交付,后续好报可恢复
+void TestDeviceSession::udpMalformedDatagramRejected()
+{
+    Rig rig(udpConfig());
+    rig.session->start();
+    QSignalSpy telSpy(rig.session.get(), &DeviceSession::telemetryReceived);
+
+    rig.transport->feedDatagram(telemetryFrame(1, 0, fourSamples())
+                                + heartbeatFrame(2, 0)); // 两帧一报
+    QCOMPARE(rig.session->malformedDatagrams(), quint32(1));
+    QCOMPARE(rig.session->state(), SessionState::Connecting); // 未交付任何帧
+
+    rig.transport->feedDatagram(telemetryFrame(3, 0, fourSamples()).left(15)); // 半帧
+    QCOMPARE(rig.session->malformedDatagrams(), quint32(2));
+
+    // 垃圾前缀 + 完整帧:droppedBytes 非零 → 整报拒绝
+    rig.transport->feedDatagram(QByteArray("garbage!!")
+                                + telemetryFrame(4, 0, fourSamples()));
+    QCOMPARE(rig.session->malformedDatagrams(), quint32(3));
+    QCOMPARE(telSpy.size(), 0);
+
+    rig.transport->feedDatagram(telemetryFrame(5, 0, fourSamples())); // 好报恢复
+    QCOMPARE(rig.session->malformedDatagrams(), quint32(3));
+    QCOMPARE(rig.session->state(), SessionState::Online);
+    QCOMPARE(telSpy.size(), 1);
+}
+
+// 重复 seq 与旧 seq 丢弃:不刷存活、不刷新实时值、不进 DB(无遥测信号)
+void TestDeviceSession::udpDuplicateAndStaleSeqDropped()
+{
+    Rig rig(udpConfig());
+    rig.goOnlineUdp(10);
+    QSignalSpy telSpy(rig.session.get(), &DeviceSession::telemetryReceived);
+    QSignalSpy hbSpy(rig.session.get(), &DeviceSession::heartbeatReceived);
+
+    rig.transport->feedDatagram(telemetryFrame(10, 0, fourSamples())); // 重复
+    QCOMPARE(rig.session->staleSeqFrames(), quint32(1));
+    rig.transport->feedDatagram(telemetryFrame(9, 0, fourSamples())); // 旧
+    QCOMPARE(rig.session->staleSeqFrames(), quint32(2));
+    QCOMPARE(telSpy.size(), 0);
+    QCOMPARE(rig.session->state(), SessionState::Online);
+
+    rig.transport->feedDatagram(heartbeatFrame(11, quint64(rig.now))); // 心跳共用 seq 空间
+    QCOMPARE(hbSpy.size(), 1);
+
+    rig.transport->feedDatagram(telemetryFrame(12, 0, fourSamples())); // 新
+    QCOMPARE(telSpy.size(), 1);
+}
+
+// seq 回绕:0xFFFFFFF0→5 视为新;绕回旧值视为旧(模 2^32 距离判别)
+void TestDeviceSession::udpSeqWraparoundAccepted()
+{
+    Rig rig(udpConfig());
+    rig.session->start();
+    QSignalSpy telSpy(rig.session.get(), &DeviceSession::telemetryReceived);
+
+    rig.transport->feedDatagram(telemetryFrame(0xFFFFFFF0u, 0, fourSamples()));
+    rig.transport->feedDatagram(telemetryFrame(5, 0, fourSamples())); // d=21 → 新
+    QCOMPARE(telSpy.size(), 2);
+
+    rig.transport->feedDatagram(telemetryFrame(0xFFFFFFF0u, 0, fourSamples())); // 绕回旧
+    QCOMPARE(telSpy.size(), 2);
+    QCOMPARE(rig.session->staleSeqFrames(), quint32(1));
+}
+
+// 旧 seq 不刷存活:持续喂旧帧仍走满 4s 失联;失联清基准后任何 seq 可接受(设备重启归零)
+void TestDeviceSession::udpStaleSeqDoesNotKeepAliveAndClearsBase()
+{
+    Rig rig(udpConfig());
+    rig.goOnlineUdp(100);
+
+    // 0.9s 间隔喂旧帧(累计 3.6s,不越过失联线):全部丢弃,不构成存活证据。
+    // 若中途先越线,enterReconnecting 会清基准,后续"旧帧"反被当新帧接受
+    for (int i = 0; i < 4; ++i) {
+        rig.advance(900);
+        rig.transport->feedDatagram(telemetryFrame(99, 0, fourSamples()));
+    }
+    QCOMPARE(rig.session->staleSeqFrames(), quint32(4));
+
+    rig.advance(500); // 恰 4100ms 无有效接收 → 失联(此后不再喂帧)
+    QCOMPARE(rig.session->state(), SessionState::Reconnecting);
+
+    QSignalSpy telSpy(rig.session.get(), &DeviceSession::telemetryReceived);
+    rig.transport->feedDatagram(telemetryFrame(0, 0, fourSamples())); // 基准已清:归零 seq 接受
+    QCOMPARE(telSpy.size(), 1);
+    QCOMPARE(rig.session->state(), SessionState::Online);
+}
+
+// UDP 失联不关绑定(LLD §3):无 close/无重 open,数据回来直接恢复
+void TestDeviceSession::udpReconnectingRecoversOnDataWithoutReopen()
+{
+    Rig rig(udpConfig());
+    rig.goOnlineUdp(100);
+    QCOMPARE(rig.transport->openCount, 1);
+    QCOMPARE(rig.transport->closeCount, 0);
+
+    rig.advance(4000); // 失联
+    QCOMPARE(rig.session->state(), SessionState::Reconnecting);
+    QCOMPARE(rig.transport->closeCount, 0); // 绑定保持
+    QCOMPARE(rig.transport->openCount, 1);
+
+    rig.transport->feedDatagram(telemetryFrame(101, quint64(rig.now), fourSamples()));
+    QCOMPARE(rig.session->state(), SessionState::Online); // 不等退避,数据即恢复
+    QCOMPARE(rig.transport->openCount, 1);
+}
+
+// UDP 不承载命令:sendCommand 直接拒绝,不产生写
+void TestDeviceSession::udpCommandRejected()
+{
+    Rig rig(udpConfig());
+    rig.goOnlineUdp(100);
+
+    QCOMPARE(rig.session->sendCommand(1), 0u);
+    QVERIFY(rig.transport->written.isEmpty());
+    QCOMPARE(rig.session->state(), SessionState::Online);
+}
+
+// 退避重试点照常走 open()(UdpTransport 幂等:已绑定则重发 opened 确认)
+void TestDeviceSession::udpBackoffRetryReconfirmsBind()
+{
+    Rig rig(udpConfig());
+    rig.goOnlineUdp(100);
+    rig.advance(4000); // 失联
+    QCOMPARE(rig.session->state(), SessionState::Reconnecting);
+
+    rig.advance(1000); // 退避 1s 到期 → 重试
+    QCOMPARE(rig.session->state(), SessionState::Connecting);
+    QCOMPARE(rig.transport->openCount, 2);
+    QCOMPARE(rig.transport->closeCount, 0);
+
+    rig.transport->feedDatagram(telemetryFrame(101, quint64(rig.now), fourSamples()));
+    QCOMPARE(rig.session->state(), SessionState::Online);
 }
 
 QTEST_MAIN(TestDeviceSession)

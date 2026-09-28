@@ -9,9 +9,11 @@ target_compile_features(dms_app PUBLIC cxx_std_17)
 target_link_libraries(dms_app PUBLIC dms_domain dms_common Qt6::Core)
 
 # 上位机可执行:GUI + IO 线程 + DB 线程 + 配置装配
+# Network/SerialPort:main 装配直接用 QHostAddress 与 QSerialPort 枚举
 add_executable(dms_monitor main.cpp)
 target_compile_features(dms_monitor PRIVATE cxx_std_17)
-target_link_libraries(dms_monitor PRIVATE dms_app dms_ui dms_persistence Qt6::Widgets)
+target_link_libraries(dms_monitor PRIVATE dms_app dms_ui dms_persistence
+                                     Qt6::Widgets Qt6::Network Qt6::SerialPort)
 
 # 配置模板部署到可执行目录(首启初始化源,docs/15 §1)
 add_custom_command(TARGET dms_monitor POST_BUILD

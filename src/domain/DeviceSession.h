@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QByteArray>
+#include <QHostAddress>
 #include <QList>
 #include <QObject>
 #include <QString>
@@ -49,8 +50,11 @@ inline QString sessionStateName(SessionState state)
     return QStringLiteral("Unknown");
 }
 
-// 超时与重试参数(app.ini 可配,LLD §3);全部可注入,受控测试用假时钟驱动
+// 超时与重试参数(app.ini 可配,LLD §3);全部可注入,受控测试用假时钟驱动。
+// transportKind 不是 ini 字段:由装配按 devices.json 的 transport 填入,
+// 决定会话状态机的链路语义差异(LLD §3)
 struct SessionConfig {
+    dms::transport::TransportKind transportKind = dms::transport::TransportKind::Tcp;
     int pollIntervalMs = 100;           // 状态检查周期
     int offlineTimeoutMs = 4000;        // 无有效接收 → 失联
     int firstFrameTimeoutMs = 4000;     // 打开后无首个有效帧 → 重连
@@ -110,6 +114,9 @@ public:
     quint32 badHeaderFrames() const { return badHeaderFrames_; }
     quint32 unknownTypeFrames() const { return unknownTypeFrames_; }
     quint32 payloadErrors() const { return payloadErrors_; }
+    // UDP 诊断(协议 §7):非"恰好一帧"被整报拒绝的报数;旧/重复 seq 丢弃的帧数
+    quint32 malformedDatagrams() const { return malformedDatagrams_; }
+    quint32 staleSeqFrames() const { return staleSeqFrames_; }
 
     static qint64 defaultClock(); // steady_clock 毫秒(与 Logger 同源)
     static int defaultJitter();   // QRandomGenerator 均匀取 -10..+10
@@ -137,6 +144,9 @@ private:
     void onTransportClosed();
     void onWriteAccepted(quint64 requestId);
     void onBytesReceived(const QByteArray &bytes);
+    // UDP 单报入口(协议 §7):一报一帧,不跨报拼接;seq 模差防御
+    void onDatagramReceived(const QByteArray &bytes, const QHostAddress &sender,
+                            quint16 senderPort);
     void onTransportError(const dms::transport::TransportError &error);
     // 返回"是否有效帧"(载荷通过):onBytesReceived 据此计 protocolHealth 的好帧数
     bool handleTelemetry(const dms::protocol::DecodedFrame &frame);
@@ -153,6 +163,13 @@ private:
     bool anyMetricStale(qint64 now) const;
     void finishPending(std::optional<CommandOutcome> outcome);
     dms::LogContext logCtx(dms::ErrorCode code = dms::ErrorCode::None) const;
+    // UDP seq 模差判断(协议 §7):d=(new-last) mod 2^32,0<d<2^31 为新;
+    // 无基准(首轮/失联清除后)任何 seq 都可作为新基准
+    bool seqIsNew(quint32 seq) const;
+    // 解码结果的计数与日志(流式/单报共用)
+    void accountDecodedEvents(const dms::protocol::FrameDecoder::Result &result);
+    // 单帧分发:心跳/遥测/ACK;返回 protocolHealth 口径的好帧
+    bool dispatchFrame(const dms::protocol::DecodedFrame &frame);
 
     QString deviceId_;
     QUuid sessionId_;
@@ -183,6 +200,11 @@ private:
     quint32 badHeaderFrames_ = 0;
     quint32 unknownTypeFrames_ = 0;
     quint32 payloadErrors_ = 0;
+    // UDP 单报防御计数(协议 §7):异常整报拒绝 / 旧·重复 seq 帧丢弃
+    quint32 malformedDatagrams_ = 0;
+    quint32 staleSeqFrames_ = 0;
+    quint32 udpLastSeq_ = 0;      // 最近接受的帧 seq 基准
+    bool udpSeqBaseValid_ = false; // 无基准时首条有效帧建立新基准
     // 采集启停(S6,LLD §6"Stop 已 ACK 后暂停遥测陈旧检测"):
     // 设备确认 Stop 后,指标陈旧不再把 Online 拉成 Degraded;
     // Start 确认后重新计时。只认 ACK 成功,不臆断未确认命令的执行结果

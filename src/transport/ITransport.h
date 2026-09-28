@@ -16,6 +16,15 @@ struct TransportError {
     QString message;
 };
 
+// 传输形态:会话状态机据此区分语义(LLD §3)——
+//   Udp:无连接概念,失联保持绑定等数据,收到有效帧直接恢复;
+//   Tcp/Serial:面向连接/独占端口,失联关链路走退避重连
+enum class TransportKind {
+    Tcp,
+    Udp,
+    Serial,
+};
+
 // 传输抽象(LLD §1):TCP/串口发 bytesReceived,UDP 另发 datagramReceived(S7)。
 // 约束:
 //   - open/close/write 全异步,结果只经信号报告,不阻塞调用线程;
