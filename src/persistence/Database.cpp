@@ -347,6 +347,15 @@ void Database::releaseConnection()
     QSqlDatabase::removeDatabase(connectionName_);
 }
 
+QString Database::sqliteVersion() const
+{
+    // 部署证据与诊断:只读单值查询,须在已打开连接上调用
+    QSqlQuery q(sql());
+    if (!q.exec(QStringLiteral("SELECT sqlite_version()")) || !q.next())
+        return {};
+    return q.value(0).toString();
+}
+
 // 只读打开既有库(查询/导出连接,docs/06 §3):
 //   - 读者不得静默创建空库:SQLite 默认会建文件,先做存在性检查;
 //   - 只设 busy_timeout(读也可能撞上写事务/checkpoint)与 query_only

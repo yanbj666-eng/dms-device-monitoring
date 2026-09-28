@@ -130,9 +130,12 @@ void DatabaseWorker::initialize(QList<dms::persistence::DeviceRow> devices)
     flushTimer_->start();
     lastFlushAtMs_ = clock_();
 
+    // 引擎版本随就绪日志留痕:跨平台部署证据(test plan §1 要求记录 SQLite 版本)
+    const QString sqliteVer = database_.sqliteVersion();
     dms::logMessage(dms::LogLevel::Info, dms::LogCategory::Db, {},
-                    QStringLiteral("数据库就绪:%1(批 %2/队列 %3/事件 %4)")
+                    QStringLiteral("数据库就绪:%1(SQLite %2,批 %3/队列 %4/事件 %5)")
                         .arg(settings_.databasePath)
+                        .arg(sqliteVer.isEmpty() ? QStringLiteral("未知") : sqliteVer)
                         .arg(settings_.batchSamples)
                         .arg(settings_.queueSamples)
                         .arg(settings_.eventQueueSize));

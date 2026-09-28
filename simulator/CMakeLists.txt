@@ -10,3 +10,6 @@ target_link_libraries(dms_simulator PRIVATE
     dms_protocol dms_common Qt6::Core Qt6::Network Qt6::SerialPort)
 
 # /utf-8、/W4 经 dms_common PUBLIC 传播,这里只补连接库
+
+# S8 发布目录:模拟器随上位机一起发布(联调工具,TC-DEPLOY-002)
+install(TARGETS dms_simulator RUNTIME DESTINATION bin)

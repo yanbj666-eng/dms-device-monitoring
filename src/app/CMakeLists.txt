@@ -19,3 +19,9 @@ target_link_libraries(dms_monitor PRIVATE dms_app dms_ui dms_persistence
 add_custom_command(TARGET dms_monitor POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             ${CMAKE_CURRENT_SOURCE_DIR}/../../config $<TARGET_FILE_DIR:dms_monitor>/config)
+
+# S8 发布目录(TC-DEPLOY-002):main.cpp 以 applicationDirPath()/config 为模板源、
+# AppLocalDataLocation 为运行根,故 config/ 必须装在 bin/ 旁(与 POST_BUILD 同构);
+# 运行期数据(logs/、SQLite)落运行根,安装目录本身可只读
+install(TARGETS dms_monitor RUNTIME DESTINATION bin)
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/../../config DESTINATION bin)

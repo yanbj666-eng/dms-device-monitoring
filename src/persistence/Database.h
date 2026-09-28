@@ -61,6 +61,9 @@ public:
     // 当前线程内使用;返回轻量句柄,调用方存局部变量
     QSqlDatabase sql() const;
 
+    // 引擎版本(SELECT sqlite_version()):部署证据与诊断用,须在已打开连接上调用
+    QString sqliteVersion() const;
+
     // 显式事务控制(见类注释);失败时 *error 带 SQLite 错误文本
     bool beginImmediate(QString *error = nullptr);
     bool commit(QString *error = nullptr);
