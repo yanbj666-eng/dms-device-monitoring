@@ -93,7 +93,9 @@ public:
                   QObject *parent = nullptr);
 
     QString deviceId() const { return deviceId_; }
-    QUuid sessionId() const { return sessionId_; } // 本地每会话 UUID,不上帧(LLD §4)
+    // 本地会话 UUID,不上帧(LLD §4)。每连接轮换(docs/06 §3):TCP/串口每次打开、
+    // UDP 每次重建 seq 基准——设备在新连接上序号归零,不轮换会撞遥测唯一键
+    QUuid sessionId() const { return sessionId_; }
     SessionState state() const { return state_; }
 
     void start(); // 人工连接 → Connecting;活动状态下重复 start 忽略
@@ -131,7 +133,9 @@ signals:
     void telemetryReceived(dms::domain::TelemetryBatch batch);
     // status 是 dms::protocol::AckStatus 的数值(quint16 直传,省一次 metatype)
     void commandAckReceived(quint32 seq, quint16 commandId, quint16 status);
-    void commandSent(quint32 seq, quint16 commandId);
+    // 写入 transport 之前发出:先于该命令的任何终态(含同步写失败的 Failed)
+    void commandSent(quint32 seq, quint16 commandId,
+                     QList<dms::protocol::CommandParam> params);
     void commandFinished(dms::domain::CommandOutcome outcome);
     void sessionError(dms::ErrorCode code, QString message);
     // 每个解码块的协议健康(S6 告警引擎消费,LLD §6):
@@ -144,6 +148,10 @@ private:
     void onTransportClosed();
     void onWriteAccepted(quint64 requestId);
     void onBytesReceived(const QByteArray &bytes);
+    // 流式解码结果的统一后处理(新数据/续解/组帧超时重同步共用):记账、分发、
+    // 协议健康、组帧计时与单轮上限续解。headAdvanced = 本轮缓存头部前进
+    void processStreamResult(const dms::protocol::FrameDecoder::Result &result,
+                             bool headAdvanced);
     // UDP 单报入口(协议 §7):一报一帧,不跨报拼接;seq 模差防御
     void onDatagramReceived(const QByteArray &bytes, const QHostAddress &sender,
                             quint16 senderPort);
@@ -155,6 +163,7 @@ private:
     void setState(SessionState next);
     // 失联/建链失败/首帧超时的统一入口:取消未决命令、关旧 transport、排退避
     void enterReconnecting(const QString &reason, dms::ErrorCode code);
+    void closeTransport(); // 主动拆链:期间收到的 closed 不触发状态迁移
     qint64 backoffDelayMs() const;
     // 任一有效帧(心跳/遥测/ACK,CRC 与载荷通过)的公共记账
     void noteValidReceive();
@@ -173,6 +182,7 @@ private:
 
     QString deviceId_;
     QUuid sessionId_;
+    QUuid commandSessionId_; // 未决命令受理时的会话 ID:终态按它定位 DB 行
     dms::transport::ITransport *transport_ = nullptr;
     dms::protocol::FrameDecoder decoder_; // 每 Session 独立流缓存(LLD §2)
     CommandTracker commands_;             // 命令生命周期(LLD §4)
@@ -187,13 +197,14 @@ private:
     bool firstValidSeen_ = false;     // 本轮是否已见首条有效消息
     qint64 lastValidReceiveMs_ = 0;   // 任一有效帧时刻,失联判定用
     qint64 metricLastMs_[4] = {0, 0, 0, 0}; // 已知指标 1..4 的最后遥测时刻
-    qint64 partialSinceMs_ = 0;       // 组帧缓存开始滞留时刻,0=无半包
+    qint64 partialSinceMs_ = 0;       // 当前候选开始滞留时刻,0=无半包
+    bool drainScheduled_ = false;     // 单轮上限后的续解已排队(只排一个)
     qint64 onlineStableSinceMs_ = 0;  // Online 起始时刻,稳定 10s 清零退避
     qint64 retryAtMs_ = 0;            // 下一次重连尝试到期时刻
     int reconnectAttempts_ = 0;       // 已点火的尝试次数,决定退避档位
     int consecutiveBadCrc_ = 0;       // 连续 CRC 错,任一有效帧清零
     int consecutiveGoodFrames_ = 0;   // Degraded 期间连续有效帧,Online 恢复用
-    bool closeByUs_ = false;          // 区分主动拆链与对端关闭
+    bool closeByUs_ = false;          // 仅 closeTransport() 调用期间为 true
 
     quint64 framesReceived_ = 0;
     quint32 badCrcFrames_ = 0;

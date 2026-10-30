@@ -355,6 +355,7 @@ private slots:
     void faultFragmentAndMergeWindows();
     void faultOfflineRecovery();
     void persistenceRoundTrip();
+    void persistenceSurvivesReconnect();
     void alarmThresholdsEndToEnd();
     void alarmCrcEndToEnd();
     void alarmStaleAndCommLostEndToEnd();
@@ -891,6 +892,79 @@ void TestIntegration::persistenceRoundTrip()
     QCOMPARE(closedSpy.first().at(1).toLongLong(), qint64(0));
     QCOMPARE(closedSpy.first().at(2).toULongLong(), quint64(0));
     QCOMPARE(closedSpy.first().at(3).toULongLong(), quint64(0));
+}
+
+// 回归(docs/06 §3):模拟器在每个新 TCP 连接上把发送序号归零。会话 ID 必须
+// 随连接轮换,否则重连后的遥测撞 (device,session,seq,metric) 唯一键,被
+// ON CONFLICT DO NOTHING 静默吞掉,直到序号追过上一连接
+void TestIntegration::persistenceSurvivesReconnect()
+{
+    // 断开窗口 1500-2000ms:首连接约 15 帧遥测后被踢,窗口后重连、序号从 1 重计
+    QVERIFY(sim_.start(1, 100, {QStringLiteral("-f"), QStringLiteral("disconnect@1500+500")}));
+
+    const QString id = QStringLiteral("itest-16");
+    DeviceManager manager;
+
+    QTemporaryDir dir;
+    dms::persistence::DbWorkerSettings settings;
+    settings.databasePath = dir.filePath(QStringLiteral("reconnect.db"));
+    settings.batchSamples = 8;
+    settings.flushIntervalMs = 200;
+    settings.queueSamples = 5000;
+    settings.eventQueueSize = 100;
+    settings.busyTimeoutMs = 200;
+    settings.shutdownFlushMs = 3000;
+    DatabaseWorker worker(settings);
+    DeviceRow row;
+    row.id = id;
+    row.name = QStringLiteral("重连设备");
+    row.transportType = QStringLiteral("tcp");
+    row.configJson = QStringLiteral("{\"id\":\"itest-16\"}");
+    worker.initialize({row});
+    QObject::connect(&manager, &DeviceManager::deviceTelemetry, &worker,
+                     &DatabaseWorker::onTelemetry);
+
+    QSignalSpy telSpy(&manager, &DeviceManager::deviceTelemetry);
+    QSignalSpy stateSpy(&manager, &DeviceManager::deviceStateChanged);
+    const auto lastState = [&stateSpy] {
+        return stateSpy.isEmpty() ? SessionState::Disconnected
+                                  : stateSpy.last().at(1).value<SessionState>();
+    };
+    const auto sawState = [&stateSpy](SessionState wanted) {
+        for (const QList<QVariant> &args : stateSpy)
+            if (args.at(1).value<SessionState>() == wanted)
+                return true;
+        return false;
+    };
+
+    manager.applySetups({tcpSetup(id, sim_.portAt(0))});
+    QTRY_VERIFY_WITH_TIMEOUT(sawState(SessionState::Reconnecting), 8000);
+    QTRY_VERIFY_WITH_TIMEOUT(lastState() == SessionState::Online, 15000);
+    const int telAfterReconnect = telSpy.size();
+    QTRY_VERIFY_WITH_TIMEOUT(telSpy.size() >= telAfterReconnect + 10, 5000);
+
+    // 先停采集再数:之后不再有新样本进 worker,交付数与入库数可精确比对
+    manager.stopAll();
+    qint64 delivered = 0;
+    QSet<QString> deliveredSessions;
+    for (const QList<QVariant> &args : telSpy) {
+        const TelemetryBatch batch = args.at(1).value<TelemetryBatch>();
+        delivered += batch.samples.size();
+        deliveredSessions.insert(batch.sessionId.toString(QUuid::WithoutBraces));
+    }
+    QCOMPARE(deliveredSessions.size(), 2); // 两个连接,两个会话
+
+    worker.drainAndClose();
+    QCOMPARE(worker.droppedSamples(), quint64(0));
+
+    Database reader;
+    QVERIFY2(reader.openExisting(settings.databasePath, 200).ok, "只读打开失败");
+    QSqlQuery count(reader.sql());
+    QVERIFY(count.exec(QStringLiteral(
+        "SELECT COUNT(*), COUNT(DISTINCT session_id) FROM telemetry WHERE device_id='itest-16'")));
+    QVERIFY(count.next());
+    QCOMPARE(count.value(0).toLongLong(), delivered); // 一个样本都不能被唯一键吞掉
+    QCOMPARE(count.value(1).toInt(), 2);
 }
 
 // S6 E2E 之一(TC-ALARM-001/002):越界值窗口 → 阈值触发/恢复 → 落库。

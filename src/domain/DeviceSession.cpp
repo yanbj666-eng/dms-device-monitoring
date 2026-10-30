@@ -100,11 +100,13 @@ void DeviceSession::stop()
     finishPending(commands_.cancel(QStringLiteral("manual disconnect")));
     if (pollTimer_)
         pollTimer_->stop();
+    // 断开后设备采集状态未知:下一轮按默认"采集活跃"评估(AlarmEngine 对
+    // Disconnected 同口径,否则引擎报 DATA_STALE 而会话仍显示 Online)
+    acquisitionActive_ = true;
     setState(SessionState::Disconnected);
     dms::logMessage(dms::LogLevel::Info, dms::LogCategory::App, logCtx(),
                     QStringLiteral("session stopping"));
-    closeByUs_ = true; // 自己拆链,closed 不再触发状态迁移
-    transport_->close();
+    closeTransport();
 }
 
 quint32 DeviceSession::sendCommand(quint16 commandId,
@@ -143,12 +145,24 @@ quint32 DeviceSession::sendCommand(quint16 commandId,
 
     const quint32 seq = commands_.nextSeq();
     commands_.start(seq, commandId, clock_());
-    const QByteArray frame = dms::protocol::encodeFrame(
-        quint8(MessageType::Command), seq, 0,
-        MessageCodec::encodeCommand(commandId, params));
+    commandSessionId_ = sessionId_;
+    // 两层编码都可能拒绝(参数值 >255B / 载荷 >4096B),空 = 编码失败
+    const QByteArray payload = MessageCodec::encodeCommand(commandId, params);
+    const QByteArray frame = payload.isEmpty()
+                                 ? QByteArray()
+                                 : dms::protocol::encodeFrame(quint8(MessageType::Command),
+                                                              seq, 0, payload);
+    emit commandSent(seq, commandId, params);
+    if (frame.isEmpty()) {
+        // LLD §4 Failed:编码失败不写半截帧;受理已广播,终态紧随其后
+        dms::logMessage(dms::LogLevel::Warn, dms::LogCategory::Protocol,
+                        logCtx(dms::ErrorCode::FramePayload),
+                        QStringLiteral("command %1 seq=%2 encoding failed").arg(commandId).arg(seq));
+        finishPending(commands_.fail(QStringLiteral("command encoding failed")));
+        return seq;
+    }
     dms::logMessage(dms::LogLevel::Info, dms::LogCategory::App, logCtx(),
                     QStringLiteral("command %1 sent, seq=%2").arg(commandId).arg(seq));
-    emit commandSent(seq, commandId);
     // write 失败同步走 errorOccurred:未决命令可能在本次调用返回前就终结为 Failed
     transport_->write(frame, seq);
     return seq;
@@ -158,16 +172,17 @@ void DeviceSession::checkTimeouts()
 {
     const qint64 now = clock_();
 
-    // 组帧超时:半包滞留超限视为死流,清缓存重新同步(LLD §2/§3)
+    // 组帧超时(LLD §2.4/§2.5):候选滞留超限,从候选起点后一字节重新同步,
+    // 保留排在其"等待区"里的有效帧,而不是清空整个缓存
     if (partialSinceMs_ > 0 && now - partialSinceMs_ >= config_.frameAssemblyTimeoutMs) {
         dms::logMessage(dms::LogLevel::Warn, dms::LogCategory::Protocol,
                         logCtx(dms::ErrorCode::FrameTimeout),
                         QStringLiteral("frame assembly stalled %1ms with %2 byte(s), "
-                                        "buffer cleared")
+                                        "resyncing after candidate")
                             .arg(now - partialSinceMs_)
                             .arg(decoder_.bufferedBytes()));
-        decoder_.reset();
         partialSinceMs_ = 0;
+        processStreamResult(decoder_.skipStalledCandidate(), /*headAdvanced=*/true);
     }
 
     // 命令 ACK 超时(LLD §4):结果未知,不自动重发
@@ -215,6 +230,9 @@ void DeviceSession::onTransportOpened()
 {
     // 新一轮连接:旧半包与指标时间全部作废(新会话将旧值标陈旧,LLD §3)
     const qint64 now = clock_();
+    // UDP 的 open 只是确认绑定,会话边界是 seq 基准重建(见 onDatagramReceived)
+    if (config_.transportKind != dms::transport::TransportKind::Udp)
+        sessionId_ = QUuid::createUuid();
     openedAtMs_ = now;
     firstValidSeen_ = false;
     lastValidReceiveMs_ = now;
@@ -232,10 +250,8 @@ void DeviceSession::onTransportOpened()
 void DeviceSession::onTransportClosed()
 {
     emit sessionClosed();
-    if (closeByUs_) {
-        closeByUs_ = false; // stop()/重连的主动拆链,不触发状态迁移
-        return;
-    }
+    if (closeByUs_)
+        return; // stop()/重连/Fault 的主动拆链,不触发状态迁移
     if (state_ == SessionState::Connecting || state_ == SessionState::Online
         || state_ == SessionState::Degraded)
         enterReconnecting(QStringLiteral("transport closed by peer"),
@@ -260,6 +276,7 @@ void DeviceSession::accountDecodedEvents(const FrameDecoder::Result &r)
     if (r.badCrcFrames > 0) {
         badCrcFrames_ += r.badCrcFrames;
         consecutiveBadCrc_ += r.badCrcFrames; // 任一有效帧清零(见 noteValidReceive)
+        consecutiveGoodFrames_ = 0; // Degraded→Online 要求"连续"有效帧(LLD §3)
         if (state_ == SessionState::Online
             && consecutiveBadCrc_ >= config_.consecutiveBadCrcLimit)
             setState(SessionState::Degraded); // 通信继续,只是降级(LLD §3)
@@ -312,7 +329,16 @@ bool DeviceSession::dispatchFrame(const DecodedFrame &f)
 
 void DeviceSession::onBytesReceived(const QByteArray &bytes)
 {
+    const qsizetype before = decoder_.bufferedBytes();
     const FrameDecoder::Result r = decoder_.decode(bytes);
+    // 有字节被消费/丢弃 = 缓存头部前进:上一候选已结束,剩余半包是新候选
+    const bool headAdvanced =
+        r.rxOverflow || decoder_.bufferedBytes() < before + bytes.size();
+    processStreamResult(r, headAdvanced);
+}
+
+void DeviceSession::processStreamResult(const FrameDecoder::Result &r, bool headAdvanced)
+{
     accountDecodedEvents(r);
 
     // 有效帧计数:心跳/遥测/ACK 且载荷通过才计入(与 noteValidReceive 同口径,
@@ -327,12 +353,24 @@ void DeviceSession::onBytesReceived(const QByteArray &bytes)
     if (r.badCrcFrames > 0 || goodFrames > 0)
         emit protocolHealth(r.badCrcFrames, goodFrames);
 
-    // 组帧滞留计时:出现半包起算,清空即止(超时判定在 checkTimeouts)
-    if (decoder_.bufferedBytes() > 0) {
-        if (partialSinceMs_ == 0)
-            partialSinceMs_ = clock_();
-    } else {
+    // 组帧滞留计时(LLD §2.4):从候选出现起算,不随追加数据延长;头部前进
+    // 说明换了新候选,重新起算——否则背靠背连续流缓存永不为空,会被误判超时
+    if (decoder_.bufferedBytes() == 0)
         partialSinceMs_ = 0;
+    else if (headAdvanced || partialSinceMs_ == 0)
+        partialSinceMs_ = clock_();
+
+    // LLD §2.1:单轮上限后让出事件循环,剩余缓存排队续解——不能等下一块数据
+    // (设备停发时会一直滞留)。context=this:会话销毁时排队调用自动作废
+    if (r.roundLimitReached && !drainScheduled_) {
+        drainScheduled_ = true;
+        QMetaObject::invokeMethod(
+            this,
+            [this] {
+                drainScheduled_ = false;
+                onBytesReceived(QByteArray());
+            },
+            Qt::QueuedConnection);
     }
 }
 
@@ -379,6 +417,8 @@ void DeviceSession::onDatagramReceived(const QByteArray &bytes, const QHostAddre
                             QStringLiteral("stale/duplicate seq %1 dropped").arg(f.seq));
             continue;
         }
+        if (!udpSeqBaseValid_)
+            sessionId_ = QUuid::createUuid(); // 新基准 = 新会话(docs/06 §3)
         udpLastSeq_ = f.seq;
         udpSeqBaseValid_ = true;
         // UDP 只承载 HEARTBEAT/TELEMETRY(协议 §7):ACK/COMMAND 意外,丢弃记日志
@@ -443,11 +483,12 @@ bool DeviceSession::handleCommandAck(const DecodedFrame &frame)
         // 与超时/取消/失败路径一致,经 finishPending 补 sessionId 再发射(S5 落库依赖)
         finishPending(outcome);
         // 设备确认过的采集启停才影响健康判定(LLD §6):Rejected/超时结果
-        // 未知,不臆断;Start 重新起算陈旧窗口
+        // 未知,不臆断;Start 重新起算陈旧窗口。Reset 按协议 §4.2 也启动遥测
         if (outcome->state == CommandState::Succeeded) {
             if (outcome->commandId == dms::protocol::CommandId::Stop) {
                 acquisitionActive_ = false;
-            } else if (outcome->commandId == dms::protocol::CommandId::Start) {
+            } else if (outcome->commandId == dms::protocol::CommandId::Start
+                       || outcome->commandId == dms::protocol::CommandId::Reset) {
                 acquisitionActive_ = true;
                 for (qint64 &t : metricLastMs_)
                     t = clock_();
@@ -479,8 +520,7 @@ void DeviceSession::onTransportError(const dms::transport::TransportError &error
         finishPending(commands_.cancel(QStringLiteral("session fault")));
         if (pollTimer_)
             pollTimer_->stop();
-        closeByUs_ = true;
-        transport_->close();
+        closeTransport();
         setState(SessionState::Fault);
         return;
     }
@@ -582,10 +622,22 @@ void DeviceSession::enterReconnecting(const QString &reason, dms::ErrorCode code
         // 重建基准,允许设备重启后序号归零(协议 §7)
         udpSeqBaseValid_ = false;
     } else {
-        closeByUs_ = true;
-        transport_->close(); // 关旧 transport(幂等:已关则无副作用)
+        closeTransport(); // 关旧 transport(幂等:已关则无副作用)
     }
     retryAtMs_ = clock_() + backoffDelayMs();
+}
+
+void DeviceSession::closeTransport()
+{
+    // ITransport 契约:closed 在 close() 栈内同步发出且恰好一次。标记只覆盖
+    // 这一次调用——对端已先关时 close() 不再发 closed,残留标记会吞掉下一轮
+    // 连接真正的对端关闭
+    closeByUs_ = true;
+    transport_->close();
+    closeByUs_ = false;
+    // 链路已拆:旧流残留不再有意义,免得退避期间误报组帧超时
+    decoder_.reset();
+    partialSinceMs_ = 0;
 }
 
 qint64 DeviceSession::backoffDelayMs() const
@@ -603,7 +655,8 @@ qint64 DeviceSession::backoffDelayMs() const
 void DeviceSession::finishPending(std::optional<CommandOutcome> outcome)
 {
     if (outcome) {
-        outcome->sessionId = sessionId_; // 入库按会话定位唯一键(S5)
+        // 入库按会话定位唯一键(S5):用受理时的 ID,不受之后的连接轮换影响
+        outcome->sessionId = commandSessionId_;
         emit commandFinished(*outcome);
     }
 }

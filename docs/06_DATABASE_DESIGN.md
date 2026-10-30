@@ -84,7 +84,7 @@ level 为 1=INFO、2=WARN、3=ERROR；metric_id=0 表示设备级告警。JSON �
 
 ## 3. 写入、查询和导出
 
-每批遥测一个事务，全部成功才提交；任一失败回滚并保留待写批次，策略见 LLD。重复的 device/session/seq/metric 使用针对该唯一键的 ON CONFLICT DO NOTHING；不能用全局 INSERT OR IGNORE 吞掉外键/非空错误。同键不同内容要日志报告，不覆盖原值。
+每批遥测一个事务，全部成功才提交；任一失败回滚并保留待写批次，策略见 LLD。约束冲突属确定性失败：回滚后隔离丢弃违规的单行/单事件并计数，其余重试。告警 cleared_at/acknowledged_at 按 MAX(事件时刻, ts) 写入，墙钟回拨也不违反 CHECK。重复的 device/session/seq/metric 使用针对该唯一键的 ON CONFLICT DO NOTHING；不能用全局 INSERT OR IGNORE 吞掉外键/非空错误。同键不同内容要日志报告，不覆盖原值。
 
 一帧多个指标共享 session_id、seq、ts、received_at。session_id 每连接/UDP 重建基准生成新 UUID；同会话用尽序列空间前更新会话，避免回绕唯一键冲突。
 

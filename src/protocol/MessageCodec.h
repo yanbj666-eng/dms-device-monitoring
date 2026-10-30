@@ -92,9 +92,10 @@ public:
 
     // 命令载荷:command_id + count + count 个 TLV,恰好消费
     static DecodeError decodeCommand(const QByteArray &payload, CommandMessage &out);
+    // 参数值 >255B 或参数 >65535 个返回空数组(长度字段放不下,不截断)
     static QByteArray encodeCommand(quint16 commandId, const QList<CommandParam> &params);
 
-    // ACK:载荷必须恰好 4B,否则 false;Seq 回显不在载荷,由帧头负责
+    // ACK:载荷必须恰好 4B 且 status∈0..4,否则 false;Seq 回显不在载荷,由帧头负责
     static bool decodeCommandAck(const QByteArray &payload, quint16 &commandId,
                                  AckStatus &status);
     static QByteArray encodeCommandAck(quint16 commandId, AckStatus status);

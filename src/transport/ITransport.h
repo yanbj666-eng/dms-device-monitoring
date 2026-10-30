@@ -53,7 +53,8 @@ public:
     // open 期间与之后的一切结果经 opened/errorOccurred 报告
     virtual void open() = 0;
 
-    // 关闭并停止一切收发;closed 恰好发一次(从未 open 过则不发)
+    // 关闭并停止一切收发;closed 恰好发一次(从未 open 过/已关闭则不发),
+    // 且在 close() 返回前同步发出——会话据此区分主动拆链与对端关闭
     virtual void close() = 0;
 
     // 异步写;requestId 由调用方提供并随 writeAccepted/error 回传,用于关联

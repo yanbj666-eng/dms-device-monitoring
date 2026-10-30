@@ -85,7 +85,8 @@ signals:
     void deviceError(QString deviceId, dms::ErrorCode code, QString message);
     void commandRejected(QString deviceId, quint16 commandId, QString reason);
     // 会话受理了命令(Sent 起点):比 deviceCommandSent 多带 params 与
-    // sessionId,供 DB worker 写 commands 表(S5)
+    // sessionId,供 DB worker 写 commands 表(S5)。在写 transport 之前发出,
+    // 对同一命令恒先于 deviceCommandFinished(含同步写失败)
     void commandSubmitted(dms::domain::CommandSubmission submission);
     void managerStopped(); // stopAll 完成(退出序列的同步点)
 

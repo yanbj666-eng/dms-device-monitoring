@@ -85,6 +85,16 @@ QString sessionKey(const QUuid &sessionId)
     return sessionId.toString(QUuid::WithoutBraces);
 }
 
+// 约束冲突(CHECK/UNIQUE/FOREIGN KEY/NOT NULL)是确定性失败:同一行重试永不成功,
+// 整批保留只会把队列永久堵死。QSQLite 的 nativeErrorCode 是 sqlite3 结果码
+// (Qt 6.4 实测为扩展码 275/2067/787),低 8 位即主码 SQLITE_CONSTRAINT=19
+bool isConstraintViolation(const QSqlError &error)
+{
+    bool ok = false;
+    const int code = error.nativeErrorCode().toInt(&ok);
+    return ok && (code & 0xFF) == 19;
+}
+
 } // namespace
 
 DatabaseWorker::DatabaseWorker(DbWorkerSettings settings, Clock clock, Sleeper sleeper,
@@ -183,8 +193,12 @@ void DatabaseWorker::onTelemetry(QString deviceId, dms::domain::TelemetryBatch b
         dropSample(deviceId, droppedHere, dms::ErrorCode::DbQueueFull,
                    QStringLiteral("遥测队列满,丢新样本"));
 
-    // 数量触发:先到者触发;失败保留整批等下一轮(LLD §7)。
+    // 数量触发:先到者触发;失败保留整批,按 flush_interval 节奏重试(LLD §7)——
+    // 失败后来帧不立即再撞锁:每次撞锁阻塞 busy_timeout,锁被长期占用时
+    // DB 线程的跨线程事件队列会无界堆积。到点由 pollFlush 或下一帧重试。
     // 走 flushOnce:发 flushCompleted 作测试/诊断同步点,并刷新时间锚点
+    if (lastFlushFailed_ && clock_() - lastFlushAtMs_ < settings_.flushIntervalMs)
+        return;
     while (int(pending_.size()) >= settings_.batchSamples) {
         if (!flushOnce())
             break;
@@ -323,12 +337,31 @@ bool DatabaseWorker::flushOnce()
     const bool telemetryOk = flushTelemetryChunk();
     const bool eventsOk = flushEvents();
     lastFlushAtMs_ = clock_();
+    lastFlushFailed_ = !(telemetryOk && eventsOk);
     emit flushCompleted(telemetryOk && eventsOk, int(pending_.size()),
                         int(events_.size()));
     return telemetryOk && eventsOk;
 }
 
 bool DatabaseWorker::flushTelemetryChunk()
+{
+    // 确定性失败的单个样本隔离丢弃后重试本批;每轮至少移除一条,循环有界
+    for (;;) {
+        int poisoned = -1;
+        if (writeTelemetryChunk(&poisoned))
+            return true;
+        if (poisoned < 0)
+            return false; // 暂时性失败(锁/IO/磁盘满):整批保留,按节奏重试
+        const PendingSample sample = pending_[size_t(poisoned)];
+        pending_.erase(pending_.begin() + poisoned);
+        dropSample(sample.deviceId, 1, dms::ErrorCode::DbWriteFailed,
+                   QStringLiteral("样本违反表约束,隔离丢弃(seq=%1 metric=%2)")
+                       .arg(sample.seq)
+                       .arg(sample.metricId));
+    }
+}
+
+bool DatabaseWorker::writeTelemetryChunk(int *poisonedIndex)
 {
     if (pending_.empty())
         return true;
@@ -359,13 +392,18 @@ bool DatabaseWorker::flushTelemetryChunk()
         insert.bindValue(5, it->ts);
         insert.bindValue(6, it->receivedAt);
         if (!insert.exec()) {
-            // 任一失败整批回滚保留(docs/06 §3);重复键不算失败
-            const QString detail = insert.lastError().text();
+            // 任一失败整批回滚(docs/06 §3);重复键不算失败。约束冲突交调用方
+            // 隔离该条,其余失败整批保留重试
+            const QSqlError error = insert.lastError();
             database_.rollback();
+            if (isConstraintViolation(error)) {
+                *poisonedIndex = int(it - pending_.begin());
+                return false;
+            }
             dms::logMessage(dms::LogLevel::Error, dms::LogCategory::Db,
                             {it->deviceId, it->sessionId, dms::ErrorCode::DbWriteFailed},
                             QStringLiteral("遥测批写入失败已回滚,整批保留重试:%1")
-                                .arg(detail));
+                                .arg(error.text()));
             return false;
         }
         if (insert.numRowsAffected() == 0)
@@ -413,6 +451,20 @@ void DatabaseWorker::reportDuplicate(const PendingSample &sample)
 
 bool DatabaseWorker::flushEvents()
 {
+    // 同遥测:确定性失败的单条事件隔离丢弃后重试其余事件,保持 FIFO 顺序
+    for (;;) {
+        int poisoned = -1;
+        if (writeEvents(&poisoned))
+            return true;
+        if (poisoned < 0)
+            return false;
+        events_.erase(events_.begin() + poisoned);
+        ++droppedEvents_;
+    }
+}
+
+bool DatabaseWorker::writeEvents(int *poisonedIndex)
+{
     if (events_.empty())
         return true;
     if (!database_.isOpen())
@@ -442,20 +494,24 @@ bool DatabaseWorker::flushEvents()
         "INSERT INTO alarms(device_id,metric_id,level,code,message,ts,acknowledged)"
         " VALUES(?,?,?,?,?,?,0)"));
     QSqlQuery alarmClear(database_.sql());
+    // MAX(...,ts):墙钟回拨时恢复/确认时刻不得早于触发时刻,否则 CHECK
+    // 失败成毒丸(与 commands 的 MAX(:finished, created_at) 同理)
     alarmClear.prepare(QStringLiteral(
-        "UPDATE alarms SET cleared_at=:cleared, clear_reason=:reason"
+        "UPDATE alarms SET cleared_at=MAX(:cleared, ts), clear_reason=:reason"
         " WHERE device_id=:dev AND code=:code AND metric_id=:metric"
         " AND cleared_at IS NULL"));
     QSqlQuery alarmAck(database_.sql());
     alarmAck.prepare(QStringLiteral(
-        "UPDATE alarms SET acknowledged=1, acknowledged_at=:at"
+        "UPDATE alarms SET acknowledged=1, acknowledged_at=MAX(:at, ts)"
         " WHERE acknowledged=0 AND id=("
         "SELECT id FROM alarms WHERE device_id=:dev AND code=:code"
         " AND metric_id=:metric ORDER BY id DESC LIMIT 1)"));
 
-    for (const Event &event : events_) {
+    for (size_t index = 0; index < events_.size(); ++index) {
+        const Event &event = events_[index];
         bool ok = false;
         QString detail;
+        QSqlError error;
         if (const CommandEvent *cmd = std::get_if<CommandEvent>(&event)) {
             if (cmd->submitted) {
                 insert.bindValue(0, cmd->deviceId);
@@ -484,7 +540,8 @@ bool DatabaseWorker::flushEvents()
                                         .arg(cmd->seq));
                 }
             }
-            detail = cmd->submitted ? insert.lastError().text() : update.lastError().text();
+            error = cmd->submitted ? insert.lastError() : update.lastError();
+            detail = error.text();
         } else if (const dms::domain::AlarmEvent *alarm =
                        std::get_if<dms::domain::AlarmEvent>(&event)) {
             switch (alarm->kind) {
@@ -496,6 +553,8 @@ bool DatabaseWorker::flushEvents()
                 alarmInsert.bindValue(4, alarm->message);
                 alarmInsert.bindValue(5, alarm->atMs);
                 ok = alarmInsert.exec();
+                error = alarmInsert.lastError();
+                detail = error.text();
                 break;
             case dms::domain::AlarmEvent::Kind::Cleared:
                 alarmClear.bindValue(QStringLiteral(":cleared"), alarm->atMs);
@@ -504,7 +563,8 @@ bool DatabaseWorker::flushEvents()
                 alarmClear.bindValue(QStringLiteral(":code"), alarm->code);
                 alarmClear.bindValue(QStringLiteral(":metric"), alarm->metricId);
                 ok = alarmClear.exec();
-                detail = alarmClear.lastError().text();
+                error = alarmClear.lastError();
+                detail = error.text();
                 if (ok && alarmClear.numRowsAffected() == 0) {
                     // 触发行被丢过(队列满/重启恢复已关闭):如实报告
                     dms::logMessage(dms::LogLevel::Warn, dms::LogCategory::Db,
@@ -522,7 +582,8 @@ bool DatabaseWorker::flushEvents()
                 alarmAck.bindValue(QStringLiteral(":code"), alarm->code);
                 alarmAck.bindValue(QStringLiteral(":metric"), alarm->metricId);
                 ok = alarmAck.exec();
-                detail = alarmAck.lastError().text();
+                error = alarmAck.lastError();
+                detail = error.text();
                 if (ok && alarmAck.numRowsAffected() == 0)
                     dms::logMessage(dms::LogLevel::Warn, dms::LogCategory::Db,
                                     {alarm->deviceId, {}},
@@ -534,6 +595,16 @@ bool DatabaseWorker::flushEvents()
         }
         if (!ok) {
             database_.rollback();
+            if (isConstraintViolation(error)) {
+                // 重试永不成功:报告后交 flushEvents 隔离这一条(计入 droppedEvents)
+                dms::logMessage(dms::LogLevel::Error, dms::LogCategory::Db,
+                                {QString(), {}, dms::ErrorCode::DbWriteFailed},
+                                QStringLiteral("事件违反表约束,隔离丢弃(第 %1 条):%2")
+                                    .arg(index)
+                                    .arg(detail));
+                *poisonedIndex = int(index);
+                return false;
+            }
             dms::logMessage(dms::LogLevel::Error, dms::LogCategory::Db,
                             {QString(), {}, dms::ErrorCode::DbWriteFailed},
                             QStringLiteral("事件写入失败已回滚,整批保留重试:%1")
@@ -581,9 +652,8 @@ void DatabaseWorker::drainAndClose()
     if (!fatal_ && database_.isOpen()) {
         const qint64 deadline = clock_() + settings_.shutdownFlushMs;
         while ((!pending_.empty() || !events_.empty()) && clock_() < deadline) {
-            flushOnce();
-            if (pending_.empty() && events_.empty())
-                break;
+            if (flushOnce())
+                continue; // 成功:积压多于一批时立即续写下一批,不空等
             // 失败按 flush 节奏重试,不超预算(LLD §7:最多等 shutdown_flush_ms)
             const qint64 remaining = deadline - clock_();
             if (remaining > 0)

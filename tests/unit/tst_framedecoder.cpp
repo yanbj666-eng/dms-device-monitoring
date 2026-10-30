@@ -44,6 +44,8 @@ private slots:
     // ---- 上限与恢复 ----
     void overflowDropsAndRecovers();
     void hundredFrameRoundLimit();
+    void exactRoundLimitLeavesNoBacklog();
+    void skipStalledCandidateKeepsLaterFrames();
 
 private:
     static constexpr quint8 kUnknownType = 0x20; // v1 保留(协议 §4)
@@ -254,10 +256,48 @@ void TestFrameDecoder::hundredFrameRoundLimit()
     const auto r1 = dec.decode(stream);
     QCOMPARE(r1.frames.size(), 100);
     QVERIFY(dec.bufferedBytes() > 0);
+    QVERIFY(r1.roundLimitReached); // 调用方据此让出事件循环后续解
 
     const auto r2 = dec.decode(QByteArray());
     QCOMPARE(r2.frames.size(), 50);
     QCOMPARE(dec.bufferedBytes(), 0);
+    QVERIFY(!r2.roundLimitReached);
+}
+
+// 恰好 100 帧:到达上限但缓存已空,不需要续解
+void TestFrameDecoder::exactRoundLimitLeavesNoBacklog()
+{
+    const QByteArray hb = QByteArray::fromHex(
+        "aa5501010000000100000000000000000000ee17d1cf");
+    FrameDecoder dec;
+    const auto r = dec.decode(hb.repeated(100));
+    QCOMPARE(r.frames.size(), 100);
+    QCOMPARE(dec.bufferedBytes(), 0);
+    QVERIFY(!r.roundLimitReached);
+}
+
+// LLD §2.5:组帧超时从候选起点后一字节重新搜索,保留后续有效帧。
+// 候选头声明 4000B 载荷,真实帧都落在"等待区"里:清空缓存会一并丢掉它们
+void TestFrameDecoder::skipStalledCandidateKeepsLaterFrames()
+{
+    QByteArray bogus = QByteArray::fromHex("aa5501010000000700000000000000000000");
+    bogus[8] = char(0x0F); // payloadLen = 0x0FA0 = 4000,合法头,等不齐
+    bogus[9] = char(0xA0);
+    const QByteArray hb = QByteArray::fromHex(
+        "aa5501010000000100000000000000000000ee17d1cf");
+
+    FrameDecoder dec;
+    const auto r1 = dec.decode(bogus + hb + hb);
+    QCOMPARE(r1.frames.size(), 0); // 都被当成候选帧的载荷在等
+    QCOMPARE(dec.bufferedBytes(), bogus.size() + 2 * hb.size());
+
+    const auto r2 = dec.skipStalledCandidate();
+    QCOMPARE(r2.frames.size(), 2);
+    QCOMPARE(r2.droppedBytes, quint32(bogus.size())); // 只丢候选本身
+    QCOMPARE(dec.bufferedBytes(), 0);
+
+    FrameDecoder empty;
+    QCOMPARE(empty.skipStalledCandidate().frames.size(), 0); // 空缓存无副作用
 }
 
 QTEST_MAIN(TestFrameDecoder)

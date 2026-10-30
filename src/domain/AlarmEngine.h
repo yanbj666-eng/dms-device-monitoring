@@ -107,7 +107,8 @@ public slots:
     // 会话每解码块的协议健康(先计坏帧突发后计有效帧,与会话自身 streak
     // 更新顺序一致,见 DeviceSession::onBytesReceived)
     void onProtocolHealth(QString deviceId, quint32 badCrcFrames, quint32 goodFrames);
-    // 只认设备确认过的 Start/Stop(Succeeded = ACK Success):驱动采集启停
+    // 只认设备确认过的 Start/Stop/Reset(Succeeded = ACK Success):驱动采集启停
+    // (Reset 按协议 §4.2 会启动遥测,与 Start 同样恢复检测)
     void onCommandFinished(QString deviceId, dms::domain::CommandOutcome outcome);
     // 确认该键最近一条未确认记录(活跃或已恢复均可,LLD §6)
     void acknowledge(QString deviceId, QString code, quint16 metricId);
@@ -129,6 +130,9 @@ private:
         QHash<quint32, Record> records;
         QHash<quint16, AlarmRule> rules;  // metricId -> 规则
         qint64 metricSeenMs[4] = {0, 0, 0, 0}; // 指标 1..4 最近有效值时刻
+        // 会话处于 Online/Degraded:只有链路已建立才评估 DATA_STALE(LLD §3
+        // "Online 下"),链路未建立的问题由 COMM_LOST/人工断开语义表达
+        bool linkUp = false;
         bool acquisitionActive = true;         // Stop ACK 后暂停陈旧检测
         int crcBadStreak = 0;                  // 连续坏 CRC 帧
         int crcGoodStreak = 0;                 // 连续有效帧(解除 PROTOCOL_CRC)

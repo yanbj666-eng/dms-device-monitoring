@@ -176,6 +176,11 @@ private slots:
     void alarmLifecycleRecorded();
     void alarmUnknownDeviceDropped();
     void alarmTriggeredOutsideConstraintsDropped();
+    // ---- 审查回归:毒丸隔离/时钟回拨/退出排空/重试节奏 ----
+    void alarmTimestampsClampedOnClockRollback();
+    void constraintViolationIsolatedNotRetriedForever();
+    void drainCommitsBacklogWithoutSleeping();
+    void countTriggerRetriesAtCadenceAfterFailure();
 
 private:
     // 每用例独立:假时钟 + 小参数 worker + 临时库。
@@ -592,6 +597,116 @@ void TestDatabaseWorker::alarmTriggeredOutsideConstraintsDropped()
     h.worker->onAlarmEvent(makeAlarm(Kind::Triggered, 1000, 1, /*level=*/1));
     QCOMPARE(fx.scalar(QStringLiteral("SELECT COUNT(*) FROM alarms")).toInt(), 1);
     QCOMPARE(fx.scalar(QStringLiteral("SELECT level FROM alarms")).toInt(), 1);
+}
+
+// 墙钟回拨(NTP 校时/WSL2 休眠恢复)使恢复/确认时刻早于触发时刻:必须夹到 ts,
+// 否则 cleared_at>=ts / acknowledged_at>=ts 的 CHECK 失败,整个事件队列永久堵死
+void TestDatabaseWorker::alarmTimestampsClampedOnClockRollback()
+{
+    Harness h = makeHarness();
+    using Kind = dms::domain::AlarmEvent::Kind;
+    h.worker->onAlarmEvent(makeAlarm(Kind::Triggered, 100000));
+    h.worker->onAlarmEvent(makeAlarm(Kind::Acknowledged, 99000)); // 时钟回拨 1s
+    h.worker->onAlarmEvent(makeAlarm(Kind::Cleared, 99500));
+    QCOMPARE(h.worker->pendingEvents(), 0);
+    QCOMPARE(h.worker->droppedEvents(), quint64(0));
+
+    FixtureDb fx(h.path);
+    QSqlQuery q(QSqlDatabase::database(fx.name()));
+    QVERIFY(q.exec(QStringLiteral(
+        "SELECT acknowledged, acknowledged_at, cleared_at, clear_reason FROM alarms")));
+    QVERIFY(q.next());
+    QCOMPARE(q.value(0).toInt(), 1);
+    QCOMPARE(q.value(1).toLongLong(), qint64(100000));
+    QCOMPARE(q.value(2).toLongLong(), qint64(100000));
+    QCOMPARE(q.value(3).toString(), QStringLiteral("recovered"));
+}
+
+// 约束冲突是确定性失败,重试永不成功:单条隔离丢弃并计数,后续事件照常落库。
+// 场景:事件队列满时丢了一条恢复事件,同键再触发撞 idx_alarm_active 部分唯一索引
+void TestDatabaseWorker::constraintViolationIsolatedNotRetriedForever()
+{
+    Harness h = makeHarness();
+    using Kind = dms::domain::AlarmEvent::Kind;
+    h.worker->onAlarmEvent(makeAlarm(Kind::Triggered, 1000));
+    // (恢复事件已丢失)引擎侧同键再次触发:库里旧行仍活跃
+    h.worker->onAlarmEvent(makeAlarm(Kind::Triggered, 2000));
+    QCOMPARE(h.worker->pendingEvents(), 0);
+    QCOMPARE(h.worker->droppedEvents(), quint64(1));
+
+    // 队列没有被毒丸堵死:后续命令与告警事件正常写入
+    const QUuid session = QUuid::createUuid();
+    h.worker->onCommandSubmitted(makeSubmission(session, 1));
+    h.worker->onAlarmEvent(makeAlarm(Kind::Cleared, 3000));
+    QCOMPARE(h.worker->pendingEvents(), 0);
+
+    FixtureDb fx(h.path);
+    QCOMPARE(fx.scalar(QStringLiteral("SELECT COUNT(*) FROM alarms")).toInt(), 1);
+    QCOMPARE(fx.scalar(QStringLiteral("SELECT cleared_at FROM alarms")).toLongLong(),
+             qint64(3000));
+    QCOMPARE(fx.scalar(QStringLiteral("SELECT COUNT(*) FROM commands")).toInt(), 1);
+}
+
+// 退出排空只在失败后按节奏等待:健康库上大于一批的积压应在预算内一次写完,
+// 每批之间都睡 flush_interval 会把本可提交的样本报成"未提交"
+void TestDatabaseWorker::drainCommitsBacklogWithoutSleeping()
+{
+    Harness h = makeHarness(/*batch=*/4, /*queue=*/64, /*events=*/4,
+                            /*flushIntervalMs=*/100, /*shutdownFlushMs=*/250);
+    int sleeps = 0;
+    const std::shared_ptr<qint64> now = h.fakeNow;
+    dms::persistence::DbWorkerSettings settings;
+    settings.databasePath = h.path;
+    settings.batchSamples = 4;
+    settings.queueSamples = 64;
+    settings.eventQueueSize = 4;
+    settings.flushIntervalMs = 100;
+    settings.busyTimeoutMs = 50;
+    settings.shutdownFlushMs = 250;
+    h.worker = std::make_unique<DatabaseWorker>(
+        settings, [now] { return *now; },
+        [now, &sleeps](int ms) { ++sleeps; *now += ms; });
+    h.worker->initialize({deviceRow()});
+    QSignalSpy closedSpy(h.worker.get(), &DatabaseWorker::closed);
+
+    {
+        FixtureDb lock(h.path); // 写受阻期间积压 5 批
+        QVERIFY(lock.exec(QStringLiteral("BEGIN EXCLUSIVE")));
+        for (quint32 seq = 1; seq <= 5; ++seq)
+            h.worker->onTelemetry(QStringLiteral("dev1"), makeBatch(seq, 4));
+    }
+    QCOMPARE(h.worker->pendingSamples(), 20);
+
+    h.worker->drainAndClose(); // 锁已释放:5 批应连续写完
+    QCOMPARE(closedSpy.count(), 1);
+    QCOMPARE(closedSpy.first().at(0).toLongLong(), qint64(0));
+    QCOMPARE(sleeps, 0);
+    FixtureDb fx(h.path);
+    QCOMPARE(fx.scalar(QStringLiteral("SELECT COUNT(*) FROM telemetry")).toInt(), 20);
+}
+
+// 计数触发失败后按 flush_interval 节奏重试(LLD §7"每 1s 重试"):不能每来一帧就
+// 再撞一次锁——每次撞锁阻塞 busy_timeout,锁长时间被占时 DB 线程事件队列无界堆积
+void TestDatabaseWorker::countTriggerRetriesAtCadenceAfterFailure()
+{
+    Harness h = makeHarness(/*batch=*/4, /*queue=*/64);
+    QSignalSpy flushSpy(h.worker.get(), &DatabaseWorker::flushCompleted);
+    {
+        FixtureDb lock(h.path);
+        QVERIFY(lock.exec(QStringLiteral("BEGIN EXCLUSIVE")));
+        h.worker->onTelemetry(QStringLiteral("dev1"), makeBatch(1, 4)); // 首次尝试失败
+        QCOMPARE(flushSpy.count(), 1);
+        for (quint32 seq = 2; seq <= 6; ++seq) { // 间隔内继续来帧:不得逐帧重试
+            tick(h, 10);
+            h.worker->onTelemetry(QStringLiteral("dev1"), makeBatch(seq, 4));
+        }
+        QCOMPARE(flushSpy.count(), 1);
+    }
+    tick(h, 100); // 到重试节奏:锁已释放,积压写空
+    h.worker->onTelemetry(QStringLiteral("dev1"), makeBatch(7, 4));
+    QCOMPARE(h.worker->pendingSamples(), 0);
+    FixtureDb fx(h.path);
+    QCOMPARE(fx.scalar(QStringLiteral("SELECT COUNT(*) FROM telemetry")).toInt(), 28);
 }
 
 QTEST_MAIN(TestDatabaseWorker)

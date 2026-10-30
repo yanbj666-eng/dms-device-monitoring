@@ -120,6 +120,11 @@ private slots:
     void crc_interleavedGoodFrameResetsStreak();
     void commLost_triggersOnReconnectingClearsOnRecovery();
     void commLost_manualDisconnectClosesActiveAlarms();
+    // ---- 审查回归:DATA_STALE 只在链路已建立时评估 ----
+    void stale_notReevaluatedAfterManualDisconnect();
+    void stale_suppressedWhileLinkDown();
+    void stale_countsFromLinkUpNotFromConnecting();
+    void stale_resumedByResetAck();
 
     // ---- 混合 ----
     void telemetryFreshnessFeedsStaleDetection();
@@ -285,6 +290,7 @@ void TstAlarmEngine::stale_triggersAfterTimeoutAndClearsOnData()
 {
     EngineHarness h;
     h.engine.onSessionState(QStringLiteral("dev1"), SessionState::Connecting); // 建档+重置计时
+    h.engine.onSessionState(QStringLiteral("dev1"), SessionState::Online); // 链路建立:起算陈旧
 
     h.clock.advance(2999);
     h.engine.poll();
@@ -312,6 +318,7 @@ void TstAlarmEngine::stale_pausedByStopAckResumedByStartAck()
 {
     EngineHarness h;
     h.engine.onSessionState(QStringLiteral("dev1"), SessionState::Connecting);
+    h.engine.onSessionState(QStringLiteral("dev1"), SessionState::Online); // 链路建立:起算陈旧
 
     CommandOutcome stop;
     stop.commandId = dms::protocol::CommandId::Stop;
@@ -402,6 +409,7 @@ void TstAlarmEngine::commLost_manualDisconnectClosesActiveAlarms()
     EngineHarness h;
     h.setTempRule(10.0, 80.0, 0.0);
     h.engine.onSessionState(QStringLiteral("dev1"), SessionState::Connecting);
+    h.engine.onSessionState(QStringLiteral("dev1"), SessionState::Online); // 链路建立:起算陈旧
     h.feed(90.0); // 阈值告警活跃
     h.clock.advance(3000);
     h.engine.poll(); // 四指标陈旧告警活跃
@@ -422,6 +430,7 @@ void TstAlarmEngine::telemetryFreshnessFeedsStaleDetection()
 {
     EngineHarness h;
     h.engine.onSessionState(QStringLiteral("dev1"), SessionState::Connecting);
+    h.engine.onSessionState(QStringLiteral("dev1"), SessionState::Online); // 链路建立:起算陈旧
     h.clock.advance(2000);
     h.feed(25.0); // 只喂指标 1:其余指标陈旧,指标 1 新鲜
     h.clock.advance(1001);
@@ -430,6 +439,90 @@ void TstAlarmEngine::telemetryFreshnessFeedsStaleDetection()
     QCOMPARE(h.spy.count(AlarmEvent::Kind::Triggered, AlarmCode::DataStale, 2), 1);
     QCOMPARE(h.spy.count(AlarmEvent::Kind::Triggered, AlarmCode::DataStale, 3), 1);
     QCOMPARE(h.spy.count(AlarmEvent::Kind::Triggered, AlarmCode::DataStale, 4), 1);
+}
+
+// 人工断开关闭全部活跃告警后,陈旧检测不得在 3s 后又对已断开设备重新触发
+void TstAlarmEngine::stale_notReevaluatedAfterManualDisconnect()
+{
+    EngineHarness h;
+    h.engine.onSessionState(QStringLiteral("dev1"), SessionState::Connecting);
+    h.engine.onSessionState(QStringLiteral("dev1"), SessionState::Online);
+    h.clock.advance(3000);
+    h.engine.poll();
+    QCOMPARE(h.spy.count(AlarmEvent::Kind::Triggered, AlarmCode::DataStale, 1), 1);
+
+    h.engine.onSessionState(QStringLiteral("dev1"), SessionState::Disconnected);
+    QCOMPARE(h.engine.activeAlarmCount(), 0);
+    h.clock.advance(10000);
+    h.engine.poll();
+    QCOMPARE(h.spy.count(AlarmEvent::Kind::Triggered, AlarmCode::DataStale, 1), 1);
+    QCOMPARE(h.engine.activeAlarmCount(), 0);
+}
+
+// 失联/Fault 期间链路问题由 COMM_LOST(或 Fault 状态)表达:退避 ≥4s 时
+// 也不得叠加 DATA_STALE(重试轮之间没有 Connecting 重置计时)
+void TstAlarmEngine::stale_suppressedWhileLinkDown()
+{
+    EngineHarness h;
+    h.engine.onSessionState(QStringLiteral("dev1"), SessionState::Connecting);
+    h.engine.onSessionState(QStringLiteral("dev1"), SessionState::Online);
+    h.feedAll();
+    h.engine.onSessionState(QStringLiteral("dev1"), SessionState::Reconnecting);
+    h.clock.advance(8000); // 第 4 档退避
+    h.engine.poll();
+    QCOMPARE(h.spy.count(AlarmEvent::Kind::Triggered, AlarmCode::DataStale, 1), 0);
+    QCOMPARE(h.spy.count(AlarmEvent::Kind::Triggered, AlarmCode::CommLost, 0), 1);
+
+    h.engine.onSessionState(QStringLiteral("dev2"), SessionState::Connecting);
+    h.engine.onSessionState(QStringLiteral("dev2"), SessionState::Online);
+    h.engine.onSessionState(QStringLiteral("dev2"), SessionState::Fault);
+    h.clock.advance(8000);
+    h.engine.poll();
+    QCOMPARE(h.spy.count(AlarmEvent::Kind::Triggered, AlarmCode::DataStale, 1), 0);
+}
+
+// 建链本身可耗时数秒(连接超时 3000ms):陈旧窗口从链路建立起算,
+// 否则首条有效消息一到就因"Connecting 期间的等待"误报
+void TstAlarmEngine::stale_countsFromLinkUpNotFromConnecting()
+{
+    EngineHarness h;
+    h.engine.onSessionState(QStringLiteral("dev1"), SessionState::Connecting);
+    h.clock.advance(2500);
+    h.engine.onSessionState(QStringLiteral("dev1"), SessionState::Online); // 首条是心跳
+    h.clock.advance(600);
+    h.engine.poll();
+    QCOMPARE(h.spy.count(AlarmEvent::Kind::Triggered, AlarmCode::DataStale, 1), 0);
+    h.clock.advance(2400); // 距链路建立 3000ms
+    h.engine.poll();
+    QCOMPARE(h.spy.count(AlarmEvent::Kind::Triggered, AlarmCode::DataStale, 1), 1);
+}
+
+// 协议 §4.2:Reset ACK 后设备恢复默认周期并启动遥测——与 Start 同样恢复
+// 陈旧检测并重新计时(TC-ALARM-004 Stop/Start/Reset)
+void TstAlarmEngine::stale_resumedByResetAck()
+{
+    EngineHarness h;
+    h.engine.onSessionState(QStringLiteral("dev1"), SessionState::Connecting);
+    h.engine.onSessionState(QStringLiteral("dev1"), SessionState::Online);
+
+    CommandOutcome stop;
+    stop.commandId = dms::protocol::CommandId::Stop;
+    stop.state = CommandState::Succeeded;
+    h.engine.onCommandFinished(QStringLiteral("dev1"), stop);
+    h.clock.advance(5000);
+    h.engine.poll();
+    QCOMPARE(h.spy.count(AlarmEvent::Kind::Triggered, AlarmCode::DataStale, 1), 0);
+
+    CommandOutcome reset;
+    reset.commandId = dms::protocol::CommandId::Reset;
+    reset.state = CommandState::Succeeded;
+    h.engine.onCommandFinished(QStringLiteral("dev1"), reset);
+    h.clock.advance(2999);
+    h.engine.poll();
+    QCOMPARE(h.spy.count(AlarmEvent::Kind::Triggered, AlarmCode::DataStale, 1), 0);
+    h.clock.advance(1);
+    h.engine.poll();
+    QCOMPARE(h.spy.count(AlarmEvent::Kind::Triggered, AlarmCode::DataStale, 1), 1);
 }
 
 QTEST_MAIN(TstAlarmEngine)

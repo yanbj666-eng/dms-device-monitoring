@@ -130,25 +130,34 @@ void AlarmEngine::onSessionState(QString deviceId, dms::domain::SessionState sta
     const qint64 now = clock_();
     switch (state) {
     case SessionState::Connecting:
-        // 每一轮连接(含失联后的重试)都重置陈旧计时:与会话层
-        // onTransportOpened 重置 metricLastMs_ 同拍。失联期间不叠加
+        // 建链中(含失联后的重试轮):链路未建立,暂停陈旧评估。失联期间不叠加
         // DATA_STALE 噪声,链路问题由 COMM_LOST 单独表达(TC-ALARM-003)
-        retimeMetrics(st, now);
+        st.linkUp = false;
         break;
     case SessionState::Online:
     case SessionState::Degraded:
-        // 有效通信恢复(首条有效消息后只可能是这两个态)→ 解除 COMM_LOST
+        // 链路建立(首条有效消息后只可能是这两个态):陈旧窗口从此刻起算——
+        // 建链本身可耗时数秒,不能算作"指标无更新"(与会话层打开时重置同义)
+        if (!st.linkUp) {
+            st.linkUp = true;
+            retimeMetrics(st, now);
+        }
+        // 有效通信恢复 → 解除 COMM_LOST
         clear(st, deviceId, IdxCommLost, 0, AlarmCode::CommLost,
               QStringLiteral("recovered"), now);
         break;
     case SessionState::Reconnecting:
         // 失联:重复进入不重复告警(活跃期间 dedup)
+        st.linkUp = false;
         trigger(st, deviceId, IdxCommLost, 0, AlarmCode::CommLost, AlarmLevel::Error,
                 QStringLiteral("无有效接收,通信失联"), now);
         break;
     case SessionState::Disconnected:
-        // 人工断开/停用:关闭该设备全部活跃告警,不新建失联告警(LLD §3/§6)。
-        // 采集标志回到默认:新一轮(新会话实例)从"采集活跃"起步
+        // 人工断开/停用:关闭该设备全部活跃告警,不新建失联告警(LLD §3/§6),
+        // 也不再评估陈旧——否则 3s 后又对已断开设备重新触发 DATA_STALE。
+        // 采集标志回到默认:重连后设备采集状态未知,按"采集活跃"评估
+        // (DeviceSession::stop 同口径)
+        st.linkUp = false;
         for (auto it = st.records.begin(); it != st.records.end(); ++it) {
             if (!it->active)
                 continue;
@@ -161,7 +170,9 @@ void AlarmEngine::onSessionState(QString deviceId, dms::domain::SessionState sta
         st.acquisitionActive = true;
         break;
     case SessionState::Fault:
-        break; // 本地不可恢复错误:告警动作未定义,保持现状
+        // 本地不可恢复错误:已有告警保持现状,链路已拆不再评估陈旧
+        st.linkUp = false;
+        break;
     }
 }
 
@@ -194,11 +205,13 @@ void AlarmEngine::onProtocolHealth(QString deviceId, quint32 badCrcFrames,
 void AlarmEngine::onCommandFinished(QString deviceId, dms::domain::CommandOutcome outcome)
 {
     // 只有设备确认执行(ACK Success)才改变采集状态;Rejected/超时结果未知,
-    // 不臆断设备已停/已启(LLD §6"Stop 已 ACK 后")
+    // 不臆断设备已停/已启(LLD §6"Stop 已 ACK 后")。Reset 按协议 §4.2
+    // "ACK 后恢复 100ms 周期并启动遥测",与 Start 同样恢复(TC-ALARM-004)
     if (outcome.state != CommandState::Succeeded)
         return;
     if (outcome.commandId != dms::protocol::CommandId::Stop
-        && outcome.commandId != dms::protocol::CommandId::Start)
+        && outcome.commandId != dms::protocol::CommandId::Start
+        && outcome.commandId != dms::protocol::CommandId::Reset)
         return;
 
     DeviceState &st = deviceState(deviceId);
@@ -206,7 +219,7 @@ void AlarmEngine::onCommandFinished(QString deviceId, dms::domain::CommandOutcom
         st.acquisitionActive = false;
     } else {
         st.acquisitionActive = true;
-        retimeMetrics(st, clock_()); // Start 后重新计时(LLD §6)
+        retimeMetrics(st, clock_()); // Start/Reset 后重新计时(LLD §6)
     }
 }
 
@@ -249,8 +262,9 @@ void AlarmEngine::poll()
         const QString deviceId = deviceIt.key();
         DeviceState &st = deviceIt.value();
         // Stop 已 ACK 后暂停整个陈旧检测:不触发新告警,也不清已有的
-        // (暂停不等于数据变新鲜;Start ACK 后重置计时,下轮 poll 自然恢复)
-        if (!st.acquisitionActive)
+        // (暂停不等于数据变新鲜;Start ACK 后重置计时,下轮 poll 自然恢复)。
+        // 链路未建立同理:已有 DATA_STALE 留到链路恢复、数据回来再解除
+        if (!st.acquisitionActive || !st.linkUp)
             continue;
         for (quint16 metricId = 1; metricId <= 4; ++metricId) {
             const bool stale = now - st.metricSeenMs[metricId - 1]
@@ -271,8 +285,8 @@ void AlarmEngine::poll()
 
 AlarmEngine::DeviceState &AlarmEngine::deviceState(const QString &deviceId)
 {
-    // 首见即建档:metricSeenMs=0,若该设备始终无遥测,3s 后如实判陈旧
-    // (会话层同样从打开时刻起算"未收到首个指标也从打开时刻计时")
+    // 首见即建档(linkUp=false):链路建立时才起算陈旧窗口,之后始终无遥测
+    // 则 3s 后如实判陈旧;从未连上的设备只会有 COMM_LOST,不会有 DATA_STALE
     return devices_[deviceId];
 }
 

@@ -75,7 +75,9 @@
 
 ### 4.3 COMMAND_ACK
 
-载荷固定为 command_id:uint16 + status:uint16；status：0 成功，1 未支持命令，2 参数非法，3 设备忙，4 执行失败。
+载荷固定为 command_id:uint16 + status:uint16；status：0 成功，1 未支持命令，2 参数非法，3 设备忙，4 执行失败。其他 status 值语义未定义，接收端按载荷错误整帧丢弃，不关联命令（该命令到点按超时、结果未知处理）。
+
+参数 TLV 的 len 为 1 字节：值超过 255B 的参数无法编码，发送端以本地 Failed 终结，不截断长度字段发出畸形帧。
 
 ACK 头部 Seq 必须回显 COMMAND 的 Seq，不消耗设备自身普通发送序列。仅在当前 TCP/串口会话、设备和 command_id 匹配时关联，不能用“收到任意 ACK”判成功。默认等待 2000ms；不自动重发。设备同会话相同 Seq+内容的重复请求复用结果，不重复执行。同 Seq 内容不同拒绝。客户端生命周期见 [LLD 第 4 节](04_DETAILED_DESIGN.md)。
 

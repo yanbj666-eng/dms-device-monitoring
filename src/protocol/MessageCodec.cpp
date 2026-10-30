@@ -156,6 +156,15 @@ DecodeError MessageCodec::decodeCommand(const QByteArray &payload, CommandMessag
 
 QByteArray MessageCodec::encodeCommand(quint16 commandId, const QList<CommandParam> &params)
 {
+    // 发送侧防御:count 是 u16、TLV len 是 u8,静默截断会发出声明长度与实际
+    // 不符的畸形帧;返回空数组让调用方显式失败(合法载荷至少 4B,空即失败)
+    if (params.size() > 0xFFFF)
+        return QByteArray();
+    for (const auto &param : params) {
+        if (param.value.size() > 0xFF)
+            return QByteArray();
+    }
+
     QByteArray p;
     p.reserve(kCommandHeaderSize + params.size() * (kTlvHeaderSize + 4));
     char hdr[kCommandHeaderSize];
@@ -176,8 +185,11 @@ bool MessageCodec::decodeCommandAck(const QByteArray &payload, quint16 &commandI
     if (payload.size() != 4) // 固定 4B,多一字节都算错(协议 §4.3)
         return false;
     const auto *d = reinterpret_cast<const uchar *>(payload.constData());
+    const quint16 rawStatus = qFromBigEndian<quint16>(d + 2);
+    if (rawStatus > quint16(AckStatus::Failed))
+        return false; // 协议 §4.3 只定义 0..4:域外值语义未知,按载荷错误拒绝
     commandId = qFromBigEndian<quint16>(d);
-    status = static_cast<AckStatus>(qFromBigEndian<quint16>(d + 2));
+    status = static_cast<AckStatus>(rawStatus);
     return true;
 }
 

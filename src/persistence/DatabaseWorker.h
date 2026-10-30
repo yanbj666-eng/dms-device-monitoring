@@ -36,6 +36,7 @@ struct DbWorkerSettings {
 //   - 遥测有界批队列:batch_samples 或 flush_interval_ms 先到者触发,
 //     队列满丢新样本并累计 droppedSamples(不丢旧、不静默);
 //   - 每批一个 BEGIN IMMEDIATE 事务,任一失败整批回滚保留,按节奏重试;
+//     约束冲突是确定性失败(重试永不成功),单条隔离丢弃计数,不堵死队列;
 //     重复键 ON CONFLICT(唯一键) DO NOTHING,同键异值日志报告不覆盖;
 //   - 命令/告警事件共用一条 FIFO(容量 event_queue_size):受理(Sent 插入)、
 //     终态(更新)与告警触发/恢复/确认保持到达顺序;空闲时直写低延迟,
@@ -43,7 +44,7 @@ struct DbWorkerSettings {
 //   - received_at/created_at/finished_at 在本层入队时打点(UTC 墙钟):
 //     跨线程 queued 延迟毫秒级,换来单一时钟源与可注入可测性。
 //     告警列例外:atMs 由引擎在裁决点打(测试注入假时钟可断言时间列),
-//     本层照抄,满足 cleared_at ≥ ts 的 CHECK 只依赖 FIFO 顺序。
+//     本层照抄;恢复/确认时刻写入时夹到 ≥ ts,墙钟回拨也不触发 CHECK 毒丸。
 // 线程约定:无 parent → moveToThread;started 槽里 initialize;
 // GUI/IO 只经 queued 信号喂数据,结果经 flushCompleted/closed/dbFatal 回报
 class DatabaseWorker : public QObject
@@ -122,6 +123,9 @@ private:
 
     bool flushTelemetryChunk(); // 一批一事务(batch_samples 上限,LLD §7)
     bool flushEvents();         // 事件 FIFO 一事务清空(命令+告警)
+    // 单次事务尝试;约束冲突时回滚并写出违规条目下标(其余失败下标保持 -1)
+    bool writeTelemetryChunk(int *poisonedIndex);
+    bool writeEvents(int *poisonedIndex);
     // 两者都试,刷新时间锚点并发 flushCompleted;返回本轮是否全部成功
     bool flushOnce();
     void reportDuplicate(const PendingSample &sample); // 同键异值诊断
@@ -139,6 +143,7 @@ private:
     std::deque<Event> events_;
     QSet<QString> knownDevices_; // 已 upsert 设备:防 FK 毒丸堵死队列
     qint64 lastFlushAtMs_ = 0;
+    bool lastFlushFailed_ = false; // 失败后计数触发也按 flush_interval 节奏重试
     bool stopped_ = false; // drainAndClose 之后
     bool fatal_ = false;   // initialize 失败,拒绝一切写入
     quint64 droppedSamples_ = 0;

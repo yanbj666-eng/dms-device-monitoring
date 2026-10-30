@@ -15,7 +15,6 @@
 #include <QTimer>
 
 #include "CurveWidget.h"
-#include "TelemetryBuffer.h"
 
 namespace dms::ui {
 
@@ -95,7 +94,7 @@ MainWindow::MainWindow(int refreshIntervalMs, int curvePoints,
     connect(deviceList_->selectionModel(), &QItemSelectionModel::selectionChanged,
             this, &MainWindow::onSelectionChanged);
     for (const auto &pair : deviceIdAndNames)
-        buffers_.insert(pair.first, new TelemetryBuffer(curvePoints));
+        buffers_.insert(pair.first, TelemetryBuffer(curvePoints));
 
     // ---- 右侧:四指标曲线 2×2 ----
     auto *curveGrid = new QWidget(this);
@@ -186,8 +185,8 @@ void MainWindow::onDeviceStateChanged(QString deviceId, dms::domain::SessionStat
 
 void MainWindow::onDeviceTelemetry(QString deviceId, dms::domain::TelemetryBatch batch)
 {
-    TelemetryBuffer *buffer = buffers_.value(deviceId, nullptr);
-    if (!buffer)
+    const auto buffer = buffers_.find(deviceId);
+    if (buffer == buffers_.end())
         return; // 未配置设备(理论上不会:装配时已建)
     buffer->append(batch.samples);
     model_->touchTelemetry(deviceId);
@@ -310,12 +309,10 @@ void MainWindow::refreshAlarmCount()
 void MainWindow::refreshCurves()
 {
     // 只重绘当前选中设备的曲线;其他设备缓冲照常积累(HLD §3 隔离)
-    if (!selectedDevice_.isEmpty()) {
-        TelemetryBuffer *buffer = buffers_.value(selectedDevice_, nullptr);
-        if (buffer) {
-            for (int i = 0; i < 4; ++i)
-                curves_[i]->setSeries(buffer->series(kMetrics[i].metricId));
-        }
+    const auto buffer = buffers_.constFind(selectedDevice_);
+    if (buffer != buffers_.constEnd()) {
+        for (int i = 0; i < 4; ++i)
+            curves_[i]->setSeries(buffer->series(kMetrics[i].metricId));
     }
     model_->refreshTimes();
 }
@@ -331,7 +328,7 @@ void MainWindow::sendReset()
 {
     if (selectedDevice_.isEmpty())
         return;
-    emit sendCommandRequested(selectedDevice_, 3, {});
+    emit sendCommandRequested(selectedDevice_, dms::protocol::CommandId::Reset, {});
 }
 
 void MainWindow::sendSetPeriod()
@@ -344,7 +341,7 @@ void MainWindow::sendSetPeriod()
     param.value = QByteArray(4, Qt::Uninitialized);
     qToBigEndian<quint32>(quint32(periodSpin_->value()),
                           param.value.data()); // TLV 值大端(协议 §4.1)
-    emit sendCommandRequested(selectedDevice_, 4, {param});
+    emit sendCommandRequested(selectedDevice_, dms::protocol::CommandId::SetParameter, {param});
 }
 
 void MainWindow::updateStatusBar()

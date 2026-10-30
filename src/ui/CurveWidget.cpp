@@ -27,6 +27,9 @@ void CurveWidget::paintEvent(QPaintEvent *)
 
     const QRectF area = rect().adjusted(8, 8, -8, -8);
     const QFontMetricsF fm(font());
+    QFont small = font(); // 刻度/跨度标注用小字
+    small.setPointSizeF(font().pointSizeF() * 0.8);
+    const QFontMetricsF smallFm(small);
 
     // 标题行:名称 + 当前值(最新点);空数据显示等待占位
     QString headline = title_;
@@ -37,7 +40,9 @@ void CurveWidget::paintEvent(QPaintEvent *)
     p.setPen(palette().color(QPalette::Text));
     p.drawText(QPointF(area.left(), area.top() + fm.ascent()), headline);
 
-    const QRectF plot = area.adjusted(0, fm.height() + 4, 0, -fm.height() - 4);
+    // 顶部刻度画在最上网格线之上:为它留出一行小字高度,否则压住标题行
+    const QRectF plot =
+        area.adjusted(0, fm.height() + smallFm.height() + 4, 0, -fm.height() - 4);
     if (points_.size() < 2) {
         p.setPen(palette().color(QPalette::PlaceholderText));
         p.drawText(plot, Qt::AlignCenter, QStringLiteral("等待数据…"));
@@ -64,8 +69,6 @@ void CurveWidget::paintEvent(QPaintEvent *)
 
     // 三条横向网格线 + 上下界标注
     p.setPen(palette().color(QPalette::Mid));
-    QFont small = font();
-    small.setPointSizeF(font().pointSizeF() * 0.8);
     p.setFont(small);
     for (int i = 0; i <= 2; ++i) {
         const double ratio = double(i) / 2.0;

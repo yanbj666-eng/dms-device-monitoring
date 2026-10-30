@@ -38,6 +38,9 @@ public:
 
     bool deferOpen = false;    // true: open() 不发 opened(停在 Connecting)
     bool acceptWrites = true;  // false: write() 不发 writeAccepted
+    // true: 严格按 ITransport 契约"closed 恰好发一次"——已关闭再 close() 不发
+    // (真实 TcpTransport 对端先关后会话再 close 即如此);默认 false 保持旧用例语义
+    bool strictCloseContract = false;
     int openCount = 0;
     int closeCount = 0;        // UDP 失联不关绑定的断言用(LLD §3)
     QList<QByteArray> written;
@@ -46,11 +49,19 @@ public:
     {
         ++openCount;
         if (!deferOpen)
-            emit opened();
+            completeOpen();
     }
     void close() override
     {
         ++closeCount;
+        if (strictCloseContract && !open_)
+            return;
+        open_ = false;
+        emit closed();
+    }
+    void peerClose() // 对端拆链:transport 自发 closed,会话事先不知情
+    {
+        open_ = false;
         emit closed();
     }
     void write(const QByteArray &bytes, quint64 requestId) override
@@ -68,7 +79,14 @@ public:
         emit datagramReceived(bytes, QHostAddress(QHostAddress::LocalHost), 55001);
     }
     void injectError(dms::transport::TransportError e) { emit errorOccurred(e); }
-    void completeOpen() { emit opened(); } // deferOpen 后异步补发"握手完成"
+    void completeOpen() // deferOpen 后异步补发"握手完成"
+    {
+        open_ = true;
+        emit opened();
+    }
+
+private:
+    bool open_ = false;
 };
 
 QByteArray telemetryFrame(quint32 seq, quint64 ts, const QList<TelemetrySample> &samples,
@@ -229,6 +247,19 @@ private slots:
     void udpReconnectingRecoversOnDataWithoutReopen();
     void udpCommandRejected();
     void udpBackoffRetryReconfirmsBind();
+
+    // ---- 审查回归:会话标识/组帧/采集状态 ----
+    void sessionIdRotatesPerConnection();
+    void udpSessionIdRotatesWhenSeqBaseRebuilt();
+    void manualReconnectResetsAcquisitionState();
+    void resetAckResumesStaleWindow();
+    void degradedRecoveryNeedsConsecutiveGoodFrames();
+    void peerCloseAfterReconnectStillDetected();
+    void ackWithUndefinedStatusIsPayloadError();
+    void commandEncodeFailureFinishesFailed();
+    void roundLimitBacklogDrainedWithoutNewData();
+    void continuousStreamNotCutByAssemblyTimeout();
+    void assemblyTimeoutKeepsFramesBehindStalledCandidate();
 
 private:
     QTemporaryDir tempRoot_;
@@ -1182,6 +1213,229 @@ void TestDeviceSession::udpBackoffRetryReconfirmsBind()
 
     rig.transport->feedDatagram(telemetryFrame(101, quint64(rig.now), fourSamples()));
     QCOMPARE(rig.session->state(), SessionState::Online);
+}
+
+// docs/06 §3:session_id 每连接生成新 UUID。设备在新连接上发送序号归零,
+// 会话 ID 不轮换则新连接遥测撞 (device,session,seq,metric) 唯一键被 DB 静默丢弃
+void TestDeviceSession::sessionIdRotatesPerConnection()
+{
+    Rig rig;
+    QSignalSpy telSpy(rig.session.get(), &DeviceSession::telemetryReceived);
+    rig.goOnline(1);
+    const QUuid first = rig.session->sessionId();
+    QCOMPARE(telSpy.last().at(0).value<TelemetryBatch>().sessionId, first);
+
+    rig.transport->feed(telemetryFrame(2, quint64(rig.now), fourSamples()));
+    QCOMPARE(rig.session->sessionId(), first); // 同一连接内稳定
+
+    rig.transport->close(); // 对端关闭 → Reconnecting
+    rig.advance(1000);      // 退避到期 → 新连接
+    rig.transport->feed(telemetryFrame(1, quint64(rig.now), fourSamples())); // 序号归零
+    QCOMPARE(rig.session->state(), SessionState::Online);
+
+    const QUuid second = rig.session->sessionId();
+    QVERIFY(!second.isNull());
+    QVERIFY(second != first);
+    QCOMPARE(telSpy.last().at(0).value<TelemetryBatch>().sessionId, second);
+}
+
+// docs/06 §3:UDP 在重建 seq 基准时换新会话 ID(设备重启序号归零的场景)
+void TestDeviceSession::udpSessionIdRotatesWhenSeqBaseRebuilt()
+{
+    Rig rig(udpConfig());
+    QSignalSpy telSpy(rig.session.get(), &DeviceSession::telemetryReceived);
+    rig.goOnlineUdp(100);
+    const QUuid first = rig.session->sessionId();
+    rig.transport->feedDatagram(telemetryFrame(101, quint64(rig.now), fourSamples()));
+    QCOMPARE(rig.session->sessionId(), first); // 同一基准内稳定
+
+    rig.advance(4000); // 失联:清 seq 基准
+    QCOMPARE(rig.session->state(), SessionState::Reconnecting);
+    rig.transport->feedDatagram(telemetryFrame(1, quint64(rig.now), fourSamples()));
+    QCOMPARE(rig.session->state(), SessionState::Online);
+
+    const QUuid second = rig.session->sessionId();
+    QVERIFY(second != first);
+    QCOMPARE(telSpy.last().at(0).value<TelemetryBatch>().sessionId, second);
+}
+
+// 人工断开后设备采集状态未知:新一轮按"采集活跃"评估,与 AlarmEngine 对
+// Disconnected 的处理同口径——否则引擎报 DATA_STALE 而会话仍显示 Online
+void TestDeviceSession::manualReconnectResetsAcquisitionState()
+{
+    Rig rig;
+    rig.goOnline();
+    const quint32 seq = rig.session->sendCommand(dms::protocol::CommandId::Stop);
+    rig.transport->feed(ackFrame(seq, dms::protocol::CommandId::Stop, AckStatus::Success));
+
+    rig.session->stop();
+    rig.session->start();
+    rig.transport->feed(heartbeatFrame(1, quint64(rig.now))); // 设备仍停采:只有心跳
+    QCOMPARE(rig.session->state(), SessionState::Online);
+    rig.advance(2000);
+    rig.transport->feed(heartbeatFrame(2, quint64(rig.now)));
+    rig.advance(1000); // 打开后 3000ms 无遥测
+    QCOMPARE(rig.session->state(), SessionState::Degraded);
+}
+
+// 协议 §4.2:Reset ACK 后设备启动遥测,与 Start 同样恢复陈旧检测并重新计时
+void TestDeviceSession::resetAckResumesStaleWindow()
+{
+    Rig rig;
+    rig.goOnline();
+    quint32 seq = rig.session->sendCommand(dms::protocol::CommandId::Stop);
+    rig.transport->feed(ackFrame(seq, dms::protocol::CommandId::Stop, AckStatus::Success));
+    for (int i = 0; i < 4; ++i) { // 暂停期:静默 4s 不降级
+        rig.advance(1000);
+        rig.transport->feed(heartbeatFrame(300 + quint32(i), quint64(rig.now)));
+    }
+    QCOMPARE(rig.session->state(), SessionState::Online);
+
+    seq = rig.session->sendCommand(dms::protocol::CommandId::Reset);
+    rig.transport->feed(ackFrame(seq, dms::protocol::CommandId::Reset, AckStatus::Success));
+    rig.advance(2999);
+    rig.transport->feed(heartbeatFrame(400, quint64(rig.now)));
+    QCOMPARE(rig.session->state(), SessionState::Online);
+    rig.advance(1); // Reset 后 3000ms 仍无遥测:陈旧检测已恢复
+    QCOMPARE(rig.session->state(), SessionState::Degraded);
+}
+
+// LLD §3"连续 3 个有效帧":坏 CRC 帧打断恢复计数(与 AlarmEngine
+// PROTOCOL_CRC 的好帧 streak 同口径)
+void TestDeviceSession::degradedRecoveryNeedsConsecutiveGoodFrames()
+{
+    Rig rig;
+    rig.goOnline();
+    const auto badFrame = [](quint32 seq) {
+        QByteArray bad = heartbeatFrame(seq);
+        bad[bad.size() - 1] = char(uchar(bad[bad.size() - 1]) ^ 0xFF);
+        return bad;
+    };
+    for (quint32 i = 0; i < 5; ++i)
+        rig.transport->feed(badFrame(10 + i));
+    QCOMPARE(rig.session->state(), SessionState::Degraded);
+
+    quint32 seq = 200;
+    for (int round = 0; round < 3; ++round) { // 好 坏 交替:永远凑不满 3 连
+        rig.transport->feed(telemetryFrame(seq++, quint64(rig.now), fourSamples()));
+        rig.transport->feed(badFrame(seq++));
+    }
+    QCOMPARE(rig.session->state(), SessionState::Degraded);
+
+    for (int i = 0; i < 3; ++i)
+        rig.transport->feed(telemetryFrame(seq++, quint64(rig.now), fourSamples()));
+    QCOMPARE(rig.session->state(), SessionState::Online);
+}
+
+// 主动拆链标记只在 close() 调用期间有效:对端先关时会话再 close 不会再收到
+// closed(契约"恰好一次"),残留标记曾会吞掉下一轮连接真正的对端关闭
+void TestDeviceSession::peerCloseAfterReconnectStillDetected()
+{
+    Rig rig;
+    rig.transport->strictCloseContract = true;
+    rig.goOnline();
+
+    rig.transport->peerClose();
+    QCOMPARE(rig.session->state(), SessionState::Reconnecting);
+    rig.advance(1000); // 重连
+    rig.transport->feed(telemetryFrame(1, quint64(rig.now), fourSamples()));
+    QCOMPARE(rig.session->state(), SessionState::Online);
+
+    rig.transport->peerClose(); // 第二次对端关闭必须被识别,不能等 4s 失联超时
+    QCOMPARE(rig.session->state(), SessionState::Reconnecting);
+}
+
+// 协议 §4.3 之外的 ACK status:按载荷错误整帧丢弃,不终结命令(结果未知 →
+// 到点 TimedOut),也不刷新存活
+void TestDeviceSession::ackWithUndefinedStatusIsPayloadError()
+{
+    Rig rig;
+    rig.goOnline();
+    QSignalSpy finSpy(rig.session.get(), &DeviceSession::commandFinished);
+    const quint32 seq = rig.session->sendCommand(dms::protocol::CommandId::Reset);
+    rig.transport->feed(ackFrame(seq, dms::protocol::CommandId::Reset, AckStatus(7)));
+    QCOMPARE(rig.session->payloadErrors(), 1u);
+    QCOMPARE(finSpy.size(), 0);
+
+    rig.advance(2000);
+    CommandOutcome out;
+    QVERIFY(findOutcome(finSpy, seq, out));
+    QCOMPARE(out.state, CommandState::TimedOut);
+}
+
+// LLD §4"Failed:编码或本地发送失败":编码失败不写半截帧,命令进入生命周期
+// 后立即以 Failed 终结(受理与终态都有记录)
+void TestDeviceSession::commandEncodeFailureFinishesFailed()
+{
+    Rig rig;
+    rig.goOnline();
+    QSignalSpy sentSpy(rig.session.get(), &DeviceSession::commandSent);
+    QSignalSpy finSpy(rig.session.get(), &DeviceSession::commandFinished);
+    CommandParam oversized{1, kValueTypeUint32, QByteArray(256, 'x')};
+    const quint32 seq = rig.session->sendCommand(4, {oversized});
+    QVERIFY(seq != 0);
+    QVERIFY(rig.transport->written.isEmpty());
+    QCOMPARE(sentSpy.size(), 1);
+    CommandOutcome out;
+    QVERIFY(findOutcome(finSpy, seq, out));
+    QCOMPARE(out.state, CommandState::Failed);
+    // 未决槽已释放:下一条正常命令可受理
+    QVERIFY(rig.session->sendCommand(dms::protocol::CommandId::Reset) != 0);
+}
+
+// LLD §2.1:单轮 100 帧后让出事件循环——剩余缓存必须排队续解,不能等下一块
+// 数据(设备停发时会滞留,2s 后被组帧超时当半包丢掉)
+void TestDeviceSession::roundLimitBacklogDrainedWithoutNewData()
+{
+    Rig rig;
+    rig.goOnline();
+    const quint64 before = rig.session->framesReceived();
+    QByteArray burst;
+    for (quint32 i = 0; i < 150; ++i)
+        burst += heartbeatFrame(1000 + i);
+    rig.transport->feed(burst);
+    QCOMPARE(rig.session->framesReceived(), before + 100); // 本轮上限
+    QTRY_COMPARE(rig.session->framesReceived(), before + 150); // 让出后续解
+}
+
+// LLD §2.4"从候选 Magic 出现起最多 2000ms":帧背靠背连续到达、每块都停在帧中间时,
+// 缓存从不为空,但每个候选都在毫秒内完成——超时计时必须随新候选重新起算
+void TestDeviceSession::continuousStreamNotCutByAssemblyTimeout()
+{
+    Rig rig;
+    rig.goOnline();
+    const quint64 before = rig.session->framesReceived();
+    QByteArray stream;
+    for (quint32 i = 0; i < 30; ++i)
+        stream += heartbeatFrame(2000 + i);
+    for (int pos = 0; pos < stream.size(); pos += 15) { // 15B 一块,与 22B 帧错位
+        rig.transport->feed(stream.mid(pos, 15));
+        rig.advance(100);
+    }
+    QCOMPARE(rig.session->framesReceived(), before + 30);
+}
+
+// LLD §2.5:组帧超时从候选后一字节重新同步,保留后续有效帧——
+// 清空整个缓存会丢掉排在假候选后面的真实心跳,进而误判失联
+void TestDeviceSession::assemblyTimeoutKeepsFramesBehindStalledCandidate()
+{
+    Rig rig;
+    rig.goOnline();
+    const quint64 before = rig.session->framesReceived();
+    QByteArray bogus = heartbeatFrame(7).left(18); // 合法头
+    bogus[8] = char(0x0F);                          // payloadLen = 4000:永远等不齐
+    bogus[9] = char(0xA0);
+    rig.transport->feed(bogus);
+    rig.advance(1000);
+    rig.transport->feed(heartbeatFrame(8, quint64(rig.now)));
+    rig.advance(900);
+    rig.transport->feed(heartbeatFrame(9, quint64(rig.now)));
+    QCOMPARE(rig.session->framesReceived(), before); // 都困在候选的等待区
+
+    rig.advance(100); // 候选出现满 2000ms
+    QCOMPARE(rig.session->framesReceived(), before + 2);
+    rig.transport->feed(heartbeatFrame(10, quint64(rig.now))); // 缓存不再被候选卡住
+    QCOMPARE(rig.session->framesReceived(), before + 3);
 }
 
 QTEST_MAIN(TestDeviceSession)

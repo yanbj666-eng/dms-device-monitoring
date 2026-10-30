@@ -14,10 +14,10 @@ TCP/串口发 bytesReceived(bytes)；UDP 发 datagramReceived(bytes, senderAddre
 
 对应 REQ-PROTO-001/002/003。流缓存每 Session 独立，UDP 不复用。
 
-1. 有限分块读入，缓存≤64KiB，单轮最多处理 100 帧后让出事件循环。
+1. 有限分块读入，缓存≤64KiB，单轮最多处理 100 帧后让出事件循环，剩余缓存排队续解，不等下一块数据到达。
 2. 找 AA 55；无 Magic 时仅保留末尾 AA，避免跨块 Magic 丢失。
 3. 至少 18B 才读固定头；检查版本、payload_len≤4096，再计算总长 22+N。
-4. 不足帧等待；从候选 Magic 出现起最多 2000ms，不随追加数据无限延长。
+4. 不足帧等待；从候选 Magic 出现起最多 2000ms，不随追加数据无限延长；前一候选完成或丢弃后，对新候选重新计时。
 5. 头非法、CRC 错、组帧超时，从候选起点后一字节重新搜索，保留后续有效帧。
 6. 合法帧完整消费；未知 Type 跳过并计数，不刷新存活时间；已知 Type 再校验载荷。
 7. 缓存超限记录 RX_OVERFLOW 并按同步规则恢复。输出值对象，不暴露缓存内部地址。
@@ -48,9 +48,9 @@ TCP/串口发 bytesReceived(bytes)；UDP 发 datagramReceived(bytes, senderAddre
 
 ## 4. 命令生命周期
 
-对应 REQ-CMD-001/002。仅 TCP/串口 Online/Degraded 且可写时允许；每设备最多一个未决命令。键为 device_id + session_id + Seq + command_id；session_id 是本地每会话 UUID，不在帧头中。
+对应 REQ-CMD-001/002。仅 TCP/串口 Online/Degraded 且可写时允许；每设备最多一个未决命令。键为 device_id + session_id + Seq + command_id；session_id 是本地每连接 UUID（TCP/串口每次打开、UDP 每次重建 seq 基准时轮换；设备在新连接上序号可能归零），不在帧头中。
 
-- Sent：入发送队列开始 2000ms ACK 超时。
+- Sent：入发送队列开始 2000ms ACK 超时。受理事件在写 transport 之前发出，同步写失败产生的 Failed 也排在其后，落库不会先终态后受理。
 - Succeeded/Rejected：当前会话 Seq、command_id 匹配有效 ACK。
 - TimedOut：未按时收到 ACK，执行结果未知。
 - Cancelled：人工断开/链路失联；记录原因。
@@ -72,7 +72,7 @@ IO 线程的 DeviceManager 拥有 Session，负责配置快照、统一停止与
 - value>high 或 value<low 触发，等于边界不触发；高值恢复至≤high-h，低值恢复至≥low+h，h≥0。
 - 每 device_id/code/metric_id 最多一个活跃事件，持续异常不逐帧插入。
 - acknowledged_at 与 cleared_at 独立；先恢复仍可确认；再次越界新建事件。
-- 每指标 3000ms 无有效值产生 DATA_STALE；Stop 已 ACK 后暂停遥测陈旧检测，Start 已 ACK 后重新计时。此时在线健康判定也免除被明确停止的遥测新鲜条件。
+- 链路已建立（Online/Degraded）时，每指标 3000ms 无有效值产生 DATA_STALE，从链路建立时起算；Connecting/Reconnecting/Fault/人工断开期间不评估，链路问题由 COMM_LOST 表达。Stop 已 ACK 后暂停遥测陈旧检测，Start 或 Reset 已 ACK 后重新计时（Reset 按协议会启动遥测）。此时在线健康判定也免除被明确停止的遥测新鲜条件；人工断开后设备采集状态未知，会话与告警引擎都按“采集活跃”重新评估。
 - 连续 5 个坏 CRC 触发 PROTOCOL_CRC；有效帧清零连续错误计数，连续 3 个有效帧解除该退化原因。
 - COMM_LOST 在有效通信恢复时解除；人工断开关闭会话相关活跃告警，原因记 manual_disconnect。
 - 非有限值在解码层拒绝；未配置阈值的指标不触发阈值告警。
@@ -81,9 +81,9 @@ IO 线程的 DeviceManager 拥有 Session，负责配置快照、统一停止与
 
 从 S5 起异步写，不在 GUI 同步插入。遥测队列≤50000 样本，500 样本或 1000ms 提交一次，先到者触发。告警/命令预留独立 1000 事件容量。
 
-事务失败回滚，批次保留，每 1s 重试；遥测队列满丢新到样本并累计 droppedSamples。事件队列满拒绝新控制并明确报告未持久化事件，不无限增长、不伪报成功。
+暂时性失败（锁等待超时、IO、磁盘满）回滚并保留批次，每 1s 重试，数量触发路径同样遵守该节奏；约束冲突（CHECK/UNIQUE/FK）是确定性失败，回滚后单条隔离丢弃并计数，其余重试，不让一条毒丸永久堵死队列。遥测队列满丢新到样本并累计 droppedSamples。事件队列满拒绝新控制并明确报告未持久化事件，不无限增长、不伪报成功。
 
-退出先停生产，最多等待 5000ms 排空；超时显示未提交数，让用户选择继续等待或取消退出。异步等待完成后在所属线程关闭资源，再 quit/finished；不强杀线程。崩溃可能损失内存待写批次，不能承诺断电零丢失。
+退出先停生产，最多等待 5000ms 排空（仅失败后按 1s 节奏等待，积压多批时连续写出）；超时显示未提交数，让用户选择继续等待或取消退出。异步等待完成后在所属线程关闭资源，再 quit/finished；不强杀线程。崩溃可能损失内存待写批次，不能承诺断电零丢失。
 
 ## 8. 日志 / 界面 / 可选 AI
 

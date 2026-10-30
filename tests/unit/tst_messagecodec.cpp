@@ -66,6 +66,8 @@ private slots:
     void commandTrailingBytesRejected();
     void ackRoundTrip();
     void ackStrictLength();
+    void ackUndefinedStatusRejected();
+    void commandOversizedParamRejected();
 };
 
 // 编码整帧必须等于 §5 向量1:空 HEARTBEAT,Seq=1,Ts=0,22B
@@ -304,6 +306,31 @@ void TestMessageCodec::ackStrictLength()
         QByteArray::fromHex("000400"), id, st));
     QVERIFY(!dms::protocol::MessageCodec::decodeCommandAck(
         QByteArray::fromHex("0004000300"), id, st));
+}
+
+// 协议 §4.3 status 只定义 0..4:域外值不能当"拒绝"解释(结果未知),
+// 也不能流到 commands.ack_status CHECK(0..4) 成为 DB 毒丸
+void TestMessageCodec::ackUndefinedStatusRejected()
+{
+    quint16 id = 0;
+    AckStatus st = AckStatus::Success;
+    QVERIFY(dms::protocol::MessageCodec::decodeCommandAck(
+        QByteArray::fromHex("00040004"), id, st)); // 4 = Failed,域内上界
+    QCOMPARE(st, AckStatus::Failed);
+    QVERIFY(!dms::protocol::MessageCodec::decodeCommandAck(
+        QByteArray::fromHex("00040005"), id, st));
+    QVERIFY(!dms::protocol::MessageCodec::decodeCommandAck(
+        QByteArray::fromHex("0004ffff"), id, st));
+}
+
+// TLV len 是 1 字节:值超 255B 时截断长度会发出声明与实际不符的畸形帧,
+// 必须显式失败(空数组),与 encodeFrame 的超长防御同口径
+void TestMessageCodec::commandOversizedParamRejected()
+{
+    CommandParam ok{1, dms::protocol::kValueTypeUint32, QByteArray(255, 'x')};
+    QCOMPARE(dms::protocol::MessageCodec::encodeCommand(4, {ok}).size(), 4 + 4 + 255);
+    CommandParam tooLong{1, dms::protocol::kValueTypeUint32, QByteArray(256, 'x')};
+    QVERIFY(dms::protocol::MessageCodec::encodeCommand(4, {tooLong}).isEmpty());
 }
 
 QTEST_MAIN(TestMessageCodec)

@@ -124,6 +124,18 @@ FrameDecoder::Result FrameDecoder::decode(const QByteArray &chunk)
 
     // 达到单轮上限让出事件循环;未消费数据留在缓存,由下一次 decode() 继续
     trimPrefix(consumed);
+    r.roundLimitReached = !buffer_.isEmpty();
+    return r;
+}
+
+FrameDecoder::Result FrameDecoder::skipStalledCandidate()
+{
+    if (buffer_.isEmpty())
+        return Result{};
+    // 候选首字节(Magic 的 AA)出局,其后字节重新参与同步(LLD §2.5)
+    buffer_.remove(0, 1);
+    Result r = decode(QByteArray());
+    r.droppedBytes += 1;
     return r;
 }
 

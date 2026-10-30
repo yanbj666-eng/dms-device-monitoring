@@ -53,6 +53,8 @@ private:
         qint64 lastTelemetryMs = 0; // 0=从未收到
     };
 
+    static QString lastUpdateText(const Row &row);
+
     QVector<Row> rows_;
     QHash<QString, int> rowById_;
 };

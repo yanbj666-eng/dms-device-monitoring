@@ -127,21 +127,13 @@ void DeviceManager::sendCommand(QString deviceId, quint16 commandId,
         emit commandRejected(deviceId, commandId, QStringLiteral("设备不存在"));
         return;
     }
-    const quint32 seq = session->sendCommand(commandId, params);
-    if (seq == 0) {
+    // 受理记录(commandSubmitted)由会话的 commandSent 转发发出(见 createSession):
+    // 它在写 transport 之前,本地写失败同步终结为 Failed 时也保证受理先于终态
+    if (session->sendCommand(commandId, params) == 0) {
         // Session 拒绝:状态不在 Online/Degraded、transport 不可写或已有未决命令
         emit commandRejected(deviceId, commandId,
                              QStringLiteral("会话不受理(状态/未决命令/不可写)"));
-        return;
     }
-    // 受理即广播完整记录:commands 表 Sent 行所需的全部字段(S5)
-    CommandSubmission submission;
-    submission.deviceId = deviceId;
-    submission.sessionId = session->sessionId();
-    submission.seq = seq;
-    submission.commandId = commandId;
-    submission.params = params;
-    emit commandSubmitted(submission);
 }
 
 void DeviceManager::createSession(const DeviceSetup &setup)
@@ -167,7 +159,16 @@ void DeviceManager::createSession(const DeviceSetup &setup)
                 emit deviceProtocolHealth(id, badCrcFrames, goodFrames);
             });
     connect(session, &DeviceSession::commandSent, this,
-            [this, id](quint32 seq, quint16 commandId) {
+            [this, id, session](quint32 seq, quint16 commandId,
+                                const QList<dms::protocol::CommandParam> &params) {
+                // 受理即广播完整记录:commands 表 Sent 行所需的全部字段(S5)
+                CommandSubmission submission;
+                submission.deviceId = id;
+                submission.sessionId = session->sessionId();
+                submission.seq = seq;
+                submission.commandId = commandId;
+                submission.params = params;
+                emit commandSubmitted(submission);
                 emit deviceCommandSent(id, seq, commandId);
             });
     connect(session, &DeviceSession::commandFinished, this,

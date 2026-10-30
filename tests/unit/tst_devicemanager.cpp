@@ -21,6 +21,8 @@ public:
 
     bool deferOpen = false;    // true: open() 不发 opened(停在 Connecting)
     bool acceptWrites = true;  // false: write() 不发 writeAccepted
+    // true: write() 在调用栈内同步报 CONNECTION_LOST(TcpTransport 写失败路径)
+    bool failWritesSynchronously = false;
     int openCount = 0;
     QList<QByteArray> written;
 
@@ -34,6 +36,10 @@ public:
     void write(const QByteArray &bytes, quint64 requestId) override
     {
         written.append(bytes);
+        if (failWritesSynchronously) {
+            emit errorOccurred({dms::ErrorCode::ConnectionLost, QStringLiteral("write failed")});
+            return;
+        }
         if (acceptWrites)
             emit writeAccepted(requestId);
     }
@@ -155,6 +161,7 @@ private slots:
     void connectOnStartFalseSkipsStart();
     void telemetryForwardedWithDeviceId();
     void sendCommandRoutesAndFinishes();
+    void submissionPrecedesSynchronousFailure();
     void sendCommandUnknownDeviceRejected();
     void sendCommandRejectedWhenOffline();
     void applySetupsReplacesSessions();
@@ -298,6 +305,44 @@ void TestDeviceManager::sendCommandRoutesAndFinishes()
     QCOMPARE(captured.lastCommandFinishedId, QStringLiteral("d1"));
     QCOMPARE(captured.lastOutcome.state, dms::domain::CommandState::Succeeded);
     QCOMPARE(captured.lastOutcome.commandId, quint16(3));
+}
+
+// 本地写失败在 sendCommand 调用栈内同步终结为 Failed:受理记录必须先于终态
+// 发出,否则 DB 先执行终态 UPDATE(未命中)再插入 Sent 行,该行永久停在 Sent
+void TestDeviceManager::submissionPrecedesSynchronousFailure()
+{
+    DeviceManager manager;
+    FakeTransport *transport = nullptr;
+    manager.setTransportFactory([&transport](const DeviceSetup &) {
+        transport = new FakeTransport;
+        return transport;
+    });
+    manager.applySetups({setupFor(QStringLiteral("d1"))});
+    transport->feed(telemetryFrame(1, 1000, fourMetrics())); // → Online
+    transport->failWritesSynchronously = true;
+
+    QStringList order;
+    CommandSubmission submission;
+    dms::domain::CommandOutcome outcome;
+    QObject::connect(&manager, &DeviceManager::commandSubmitted,
+                     [&](const CommandSubmission &s) {
+                         order << QStringLiteral("submitted");
+                         submission = s;
+                     });
+    QObject::connect(&manager, &DeviceManager::deviceCommandFinished,
+                     [&](const QString &, const dms::domain::CommandOutcome &o) {
+                         order << QStringLiteral("finished");
+                         outcome = o;
+                     });
+
+    CommandParam param{1, dms::protocol::kValueTypeUint32, QByteArray(4, '\0')};
+    manager.sendCommand(QStringLiteral("d1"), 4, {param});
+
+    QCOMPARE(order, (QStringList{QStringLiteral("submitted"), QStringLiteral("finished")}));
+    QCOMPARE(outcome.state, dms::domain::CommandState::Failed);
+    QCOMPARE(submission.seq, outcome.seq);
+    QCOMPARE(submission.sessionId, outcome.sessionId); // DB 终态 UPDATE 按它定位行
+    QCOMPARE(submission.params.size(), 1);
 }
 
 void TestDeviceManager::sendCommandUnknownDeviceRejected()

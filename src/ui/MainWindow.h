@@ -5,6 +5,7 @@
 #include <QString>
 
 #include "DeviceListModel.h"
+#include "TelemetryBuffer.h"
 #include "domain/AlarmEngine.h"
 #include "domain/DeviceSession.h"
 #include "protocol/MessageCodec.h"
@@ -18,7 +19,6 @@ class QTimer;
 namespace dms::ui {
 
 class CurveWidget;
-class TelemetryBuffer;
 
 // 主窗口(S4 最小 UI + S6 告警面板):
 //   - 左侧设备列表(状态色/最近遥测),右侧选中设备四指标曲线;
@@ -77,7 +77,7 @@ private:
     QLabel *alarmLabel_ = nullptr;
     QTableWidget *alarmTable_ = nullptr;
     CurveWidget *curves_[4] = {nullptr, nullptr, nullptr, nullptr}; // metricId 1..4
-    QHash<QString, TelemetryBuffer *> buffers_; // 每设备一份,随窗口生命周期
+    QHash<QString, TelemetryBuffer> buffers_; // 每设备一份,值语义随窗口析构释放
     QString selectedDevice_;
     int onlineCount_ = 0;
 };

@@ -38,21 +38,27 @@ QVariant DeviceListModel::data(const QModelIndex &index, int role) const
         return row.id;
     case NameRole:
         return row.name;
-    case Qt::DisplayRole:
+    case Qt::DisplayRole: // 默认委托只画 Display/Decoration:最近遥测并入文字
+        return QStringLiteral("%1  [%2]  %3")
+            .arg(row.name, sessionStateName(row.state), lastUpdateText(row));
     case StateTextRole:
         return QStringLiteral("%1  [%2]").arg(row.name, sessionStateName(row.state));
+    case Qt::DecorationRole: // QColor 装饰由默认委托画成色块,即列表的状态色点
     case StateColorRole:
         return stateColor(row.state);
-    case LastUpdateRole: {
-        if (row.lastTelemetryMs == 0)
-            return QStringLiteral("无遥测");
-        const qint64 delta =
-            QDateTime::currentMSecsSinceEpoch() - row.lastTelemetryMs;
-        return delta < 1500 ? QStringLiteral("刚刚") : QStringLiteral("%1s 前").arg(delta / 1000);
-    }
+    case LastUpdateRole:
+        return lastUpdateText(row);
     default:
         return {};
     }
+}
+
+QString DeviceListModel::lastUpdateText(const Row &row)
+{
+    if (row.lastTelemetryMs == 0)
+        return QStringLiteral("无遥测");
+    const qint64 delta = QDateTime::currentMSecsSinceEpoch() - row.lastTelemetryMs;
+    return delta < 1500 ? QStringLiteral("刚刚") : QStringLiteral("%1s 前").arg(delta / 1000);
 }
 
 QHash<int, QByteArray> DeviceListModel::roleNames() const
@@ -108,7 +114,8 @@ void DeviceListModel::updateState(const QString &deviceId, dms::domain::SessionS
         return;
     rows_[row].state = state;
     const QModelIndex idx = index(row);
-    emit dataChanged(idx, idx, {Qt::DisplayRole, StateTextRole, StateColorRole});
+    emit dataChanged(idx, idx,
+                     {Qt::DisplayRole, Qt::DecorationRole, StateTextRole, StateColorRole});
 }
 
 void DeviceListModel::touchTelemetry(const QString &deviceId)
@@ -125,7 +132,7 @@ void DeviceListModel::refreshTimes()
         return;
     const QModelIndex first = index(0);
     const QModelIndex last = index(rows_.size() - 1);
-    emit dataChanged(first, last, {LastUpdateRole});
+    emit dataChanged(first, last, {Qt::DisplayRole, LastUpdateRole});
 }
 
 } // namespace dms::ui

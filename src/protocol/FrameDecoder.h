@@ -15,7 +15,7 @@ namespace dms::protocol {
 //   4. 头非法/CRC 错:从候选 Magic 后一字节重搜索,保留后续有效帧;
 //   5. 未知 Type CRC 正确则完整消费并计数,不交付;
 //   6. 单轮最多处理 100 帧后让出事件循环,剩余数据留待下一轮。
-// 组帧 2000ms 超时不归解码器管:时钟由会话层注入并调用 reset()(LLD §3)。
+// 组帧 2000ms 超时不归解码器管:时钟由会话层持有,到点调用 skipStalledCandidate()。
 class FrameDecoder
 {
 public:
@@ -31,6 +31,8 @@ public:
         quint32 badCrcFrames = 0;      // 合计中的 CRC 错 → FRAME_CRC(LLD §8 两种码要可区分)
         quint32 droppedBytes = 0;      // 无法构成帧而被丢弃的字节(含溢出清空)
         bool rxOverflow = false;      // 缓存超上限,已清空恢复
+        // 达到单轮上限且缓存仍有未处理字节:调用方应让出事件循环后以空块续解
+        bool roundLimitReached = false;
     };
 
     // maxBufferBytes 默认 64KiB(app.ini max_buffer_bytes);
@@ -42,7 +44,11 @@ public:
     // 不完整尾部保留在内部缓存,等下一块补齐;空块仅驱动剩余缓存。
     Result decode(const QByteArray &chunk);
 
-    // 清空缓存:新会话开始或会话层判定组帧超时时调用
+    // 组帧超时(会话层计时,LLD §2.5):丢弃滞留候选的首字节,从下一字节起
+    // 重新同步并继续解码——排在候选"等待区"里的后续有效帧得以保留
+    Result skipStalledCandidate();
+
+    // 清空缓存:新会话开始/链路拆除时调用
     void reset() { buffer_.clear(); }
 
     qsizetype bufferedBytes() const { return buffer_.size(); }
